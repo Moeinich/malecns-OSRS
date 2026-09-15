@@ -15,6 +15,7 @@ import scipy.sparse as sp
 from pyarrow import feather
 
 from flybrain.connectome import loader, vocab
+from flybrain.connectome import select as select_mod
 from flybrain.connectome.build import DEFAULT_NT_PATH, BuildParams, build
 from flybrain.connectome.registry import CellTypeRegistry
 from flybrain.connectome.select import DEFAULT_WEIGHTS_PATH, SelectionParams
@@ -63,9 +64,27 @@ def test_steering_and_escape_are_laterally_resolved(connectome):
 
 
 def test_mushroom_body_and_central_complex_are_anchored(connectome):
-    for name in ("KC", "MBON", "PPL1", "PAM"):
+    for name in ("KC", "MBON", "PPL1", "PAM", "FB"):
         assert connectome.population(name).size > 0
     assert connectome.population("KC").size == 4064
+
+
+@pytest.mark.parametrize(
+    "name",
+    [f"{family}{direction}" for family in ("T4", "T5") for direction in "abcd"]
+    + list(select_mod.VISUAL_INPUT_TYPES + select_mod.ON_RELAY_TYPES),
+)
+def test_motion_detectors_and_injection_layer_survive_selection(connectome, registry, name):
+    """No T4/T5 means no optic flow, and the core sensory claim fails outright.
+
+    They lose the top-K score cut among 89,403 ol_intrinsic neurons, so they are
+    forced anchors; the same holds for the injection layer, which the retina
+    writes into column by column. Anchors are forced, so this must hold at the
+    small K too — a per-direction subtype missing here is a motion detector the
+    network cannot compute with.
+    """
+    selected = np.intersect1d(registry.body_ids(name), connectome.body_ids)
+    assert selected.size >= 0.9 * registry.body_ids(name).size
 
 
 def test_weights_are_signed_and_inhibition_exists(connectome):

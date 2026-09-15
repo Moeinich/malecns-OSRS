@@ -33,9 +33,26 @@ DEFAULT_WEIGHTS_PATH = vocab.DEFAULT_ANNOTATIONS_PATH.parent / WEIGHTS_FILENAME
 #: carry no hex assignment and are never injected into; see the plan).
 VISUAL_INPUT_TYPES = ("L1", "L2", "L3", "Tm1")
 
+#: The elementary motion detectors, all four preferred directions each —
+#: direction selectivity is the entire point of rendering sub-frames per tick.
+#: They lose the top-K cut among 89,403 ol_intrinsic neurons, and a network
+#: without them computes no optic flow at all.
+MOTION_DETECTOR_TYPES = ("T4", "T5")
+
+#: The ON relay between injection and motion detection: L1 -> Mi1 -> T4. The
+#: OFF leg needs nothing extra, since its relay Tm1 is already an injection
+#: site. Without Mi1 the anchored L1 cells have no partner inside the subgraph
+#: at all and are dropped again as an isolated component.
+ON_RELAY_TYPES = ("Mi1",)
+
 #: Named populations forced into the subgraph. The mushroom body is where
 #: learning lives; the central complex is the heading compass.
 ANCHOR_TYPES = ("KC", "MBON", "PPL1", "PAM", "EPG", "PEN", "PEG", "FB")
+
+#: Everything the sensorimotor loop addresses by name must be present by
+#: construction, not by score: the injection layer the retina writes into, the
+#: motion detectors it drives, and the named circuits above.
+FORCED_TYPES = VISUAL_INPUT_TYPES + ON_RELAY_TYPES + MOTION_DETECTOR_TYPES + ANCHOR_TYPES
 
 
 @dataclass(frozen=True)
@@ -45,11 +62,12 @@ class SelectionParams:
     max_edges: int = 3_000_000
     max_min_syn: int = 64
     source_types: tuple[str, ...] = VISUAL_INPUT_TYPES
-    anchor_types: tuple[str, ...] = ANCHOR_TYPES
+    anchor_types: tuple[str, ...] = FORCED_TYPES
     #: Resolved from the `superclass` column: the whole 1,314-cell motor bus.
     anchor_superclasses: tuple[str, ...] = (vocab.DESCENDING_SUPERCLASS,)
-    #: Resolved from the `class` column. `FB*` tangential cells do not resolve
-    #: by name, so the CX is anchored as a class rather than type by type.
+    #: Resolved from the `class` column. This is what carries the central
+    #: complex: 2,950 cells, of which the `FB` prefix names only 575. The other
+    #: 27 `FB*` cells carry no `class` at all, so both anchors are needed.
     anchor_classes: tuple[str, ...] = ("CX",)
     ppr_alpha: float = 0.85
     ppr_iters: int = 40

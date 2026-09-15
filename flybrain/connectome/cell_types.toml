@@ -83,14 +83,25 @@ required = false
 expect = 1777
 role = "medulla OFF, 99% hex-mapped; a retina injection site"
 
-[T4a]
+[T4]
 required = false
-match = "exact"
-expect = 1684
-role = "ON motion detector; 0% hex-mapped, so never inject here directly"
+match = "prefix"
+expect = 6865
+role = "ON motion detectors, 4 directions; 0% hex-mapped, so never inject here directly"
 
-[T5a]
+[T5]
 required = false
-match = "exact"
-expect = 1664
-role = "OFF motion detector; 0% hex-mapped, so never inject here directly"
+match = "prefix"
+expect = 6720
+role = "OFF motion detectors, 4 directions; 0% hex-mapped, so never inject here directly"
+
+[FB]
+required = false
+match = "prefix"
+expect = 602
+role = "fan-shaped body; real types are FB1A/FB2B/..., so only a prefix resolves them"
+
+[Mi1]
+required = false
+expect = 1773
+role = "ON relay, L1 -> Mi1 -> T4; without it the anchored L1 has no route onward"
