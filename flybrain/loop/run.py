@@ -19,9 +19,11 @@ from flybrain.engine.calibration import (
 )
 from flybrain.engine.calibration import load as load_calibration
 from flybrain.engine.lif import LIFEngine
+from flybrain.engine.plasticity import Plasticity, kc_to_mbon
 from flybrain.loop.agent import Ablation, Agent, AgentParams, default_encoder
 from flybrain.loop.client import BridgeClient, default_socket_path
 from flybrain.motor.decode import MotorIndex
+from flybrain.reward import DopamineIndex, RewardRouter
 from flybrain.sensory.collision import DEFAULT_COLLISION_PATH, CollisionGrid
 
 
@@ -49,6 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="degree- and sign-preserving random rewire; the control that matters",
     )
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--learn",
+        action="store_true",
+        help="let dopamine rewrite the KC-MBON synapses; off leaves the weights frozen, "
+        "which is the control every scored run and every ablation is measured against",
+    )
     p.add_argument("--ticks", type=int, default=None, help="stop after N ticks")
     p.add_argument(
         "--dry-run",
@@ -93,7 +101,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {note}", file=sys.stderr)
     print(f"calibration: {calibration.describe()}", file=sys.stderr)
 
-    engine = LIFEngine(W, seed=args.seed, **calibration.engine_kwargs())
+    # Resolved against `W` — the matrix the engine is handed — because both the
+    # ablation and the calibration returned new matrices on the way here.
+    plastic = {"plastic_idx": kc_to_mbon(W, connectome)} if args.learn else {}
+    engine = LIFEngine(W, seed=args.seed, **plastic, **calibration.engine_kwargs())
+
+    reward, plasticity = _learning(connectome, engine, args.learn)
     # Imported only here: the brain must not depend on OpenCV being installed.
     hud = None
     feed = None
@@ -120,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
         params=AgentParams(substeps_per_subframe=args.substeps, dry_run=args.dry_run),
         tonic=calibration.tonic_drive(connectome.n),
         spike_sink=hud.record_spikes if hud is not None and hud.enabled else None,
+        reward=reward,
+        plasticity=plasticity,
     )
 
     started = time.monotonic()
@@ -144,6 +159,37 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _learning(connectome, engine, learn: bool) -> tuple[RewardRouter | None, Plasticity | None]:
+    """Reward routing always; weight writes only under `--learn`.
+
+    Dopamine is injected either way, so the frozen-weights control runs the same
+    network dynamics as the learning condition and differs in exactly one thing:
+    whether the update is written. A control that also removed the dopamine
+    current would confound the two.
+    """
+    try:
+        index = DopamineIndex.from_connectome(connectome)
+    except KeyError as exc:
+        if learn:
+            raise SystemExit(f"--learn needs the dopaminergic populations: {exc}") from exc
+        print(f"no reward: {exc}", file=sys.stderr)
+        return None, None
+    reward = RewardRouter(index, connectome.n)
+    print(
+        f"reward: PAM {len(index.appetitive)} appetitive, PPL1 {len(index.aversive)} aversive",
+        file=sys.stderr,
+    )
+    if not learn:
+        print("learning: OFF — weights frozen (--learn to enable)", file=sys.stderr)
+        return reward, None
+    plasticity = Plasticity.attach(engine, connectome)
+    print(
+        f"learning: ON — {plasticity.plastic_idx.size} plastic KC->MBON synapses",
+        file=sys.stderr,
+    )
+    return reward, plasticity
+
+
 def _status(agent: Agent, r) -> str:
     return (
         f"tick {r.tick} rev {r.revision} | {r.ms_total:6.1f} ms "
@@ -156,6 +202,14 @@ def _status(agent: Agent, r) -> str:
 def _summary(agent: Agent, ablation: Ablation, calibration: Calibration, elapsed: float) -> str:
     counts = ", ".join(f"{k}={v}" for k, v in sorted(agent.action_counts.items())) or "none"
     rate = f"{agent.last.mean_rate_hz:.2f} Hz" if agent.last is not None else "n/a"
+    if agent.plasticity is None:
+        learning = "frozen (no --learn)" if agent.reward is not None else "no reward routed"
+    else:
+        p = agent.plasticity
+        learning = (
+            f"{p.plastic_idx.size} KC->MBON synapses, {p.updates} updates, "
+            f"mean |w-w0| {p.drift:.3g}"
+        )
     return (
         f"\n--- {ablation.label} ---\n"
         f"ticks           {agent.ticks} in {elapsed:.1f} s\n"
@@ -166,6 +220,7 @@ def _summary(agent: Agent, ablation: Ablation, calibration: Calibration, elapsed
         f"dropped ticks   {agent.client.dropped_game_ticks}\n"
         f"calibration     {calibration.describe()}\n"
         f"mean rate       {rate}\n"
+        f"learning        {learning}\n"
         f"actions         {counts}"
     )
 

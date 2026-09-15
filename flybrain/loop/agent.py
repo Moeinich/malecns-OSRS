@@ -22,10 +22,12 @@ import scipy.sparse as sp
 
 from flybrain.connectome.loader import Connectome
 from flybrain.engine.lif import LIFEngine
+from flybrain.engine.plasticity import Plasticity
 from flybrain.loop.client import BridgeClient
 from flybrain.loop.types import Action, StateUpdate
 from flybrain.motor.body import BodyParams, to_action
 from flybrain.motor.decode import EgocentricCommand, MotorIndex, decode
+from flybrain.reward import RewardRouter
 from flybrain.sensory.collision import CollisionGrid
 from flybrain.sensory.heading import Heading
 from flybrain.sensory.retina import Retina
@@ -76,6 +78,14 @@ class TickReport:
     #: on. `None` substep means none fired — never drawn as a zero.
     escape_spikes: int
     escape_substep: int | None
+    #: DAN population rates this tick and the dopamine term taken from them.
+    #: `None` when no reward router is attached — never drawn as a zero, which
+    #: is a real dopamine level.
+    dan_appetitive_hz: float | None = None
+    dan_aversive_hz: float | None = None
+    dopamine: float | None = None
+    #: Summed |dW| written into the simulated matrix. `None` with `--learn` off.
+    weight_delta: float | None = None
 
     @property
     def kind(self) -> str:
@@ -105,6 +115,8 @@ class Agent:
         body_params: BodyParams | None = None,
         tonic: np.ndarray | None = None,
         spike_sink: Callable[[np.ndarray], None] | None = None,
+        reward: RewardRouter | None = None,
+        plasticity: Plasticity | None = None,
     ) -> None:
         self.client = client
         self.engine = engine
@@ -123,6 +135,11 @@ class Agent:
         #: Called with each substep's fired indices. Telemetry only; the loop
         #: never reads it back.
         self.spike_sink = spike_sink
+        #: Routes game events into current injected at the real PAM/PPL1 cells.
+        #: `None` leaves the brain rewardless, which is the pre-`--learn` loop.
+        self.reward = reward
+        #: Present only under `--learn`. Absent is the frozen-weights control.
+        self.plasticity = plasticity
 
         self.ticks = 0
         self.overruns = 0
@@ -155,6 +172,15 @@ class Agent:
         state = update.state
         heading = self.heading.update(state)
 
+        dan_current = None
+        if self.reward is not None:
+            self.reward.observe_reward(self.client.last_reward)
+            self.reward.observe_state(
+                self._prev_state.player if self._prev_state is not None else None,
+                state.player,
+            )
+            dan_current = self.reward.current()
+
         frames = self.retina.render_subframes(
             self._prev_state,
             state,
@@ -168,6 +194,7 @@ class Agent:
 
         per_subframe = self.substeps_per_subframe
         sink = self.spike_sink
+        learn = self.plasticity
         self.motor.begin_tick()
         ms_encode = 0.0
         ms_lif = 0.0
@@ -176,10 +203,14 @@ class Agent:
         for frame in frames:
             a = time.perf_counter()
             current = self.encoder(frame) + self.tonic
+            if dan_current is not None:
+                current = current + dan_current
             b = time.perf_counter()
             for k in range(per_subframe):
                 fired = self.engine.step(current)
                 self.motor.observe_spikes(fired, substeps + k)
+                if learn is not None:
+                    learn.observe_spikes(fired)
                 if sink is not None:
                     sink(fired)
             c = time.perf_counter()
@@ -195,6 +226,17 @@ class Agent:
 
         t_decode = time.perf_counter()
         rates = self.engine.get_firing_rates(p.rate_window_steps)
+        dan_hz = (None, None)
+        dopamine = None
+        weight_delta = None
+        if self.reward is not None:
+            dan_hz = self.reward.dan_rates(rates)
+            # The dopamine term is the DAN cells' own rate, not the game reward
+            # that drove them: the learning signal is a network variable.
+            dopamine = self.reward.dopamine(rates)
+            if learn is not None:
+                weight_delta = learn.apply(dopamine)
+            self.reward.decay()
         command = decode(rates, self.motor)
         action = to_action(command, state, heading, self.body_params)
         t_end = time.perf_counter()
@@ -230,6 +272,10 @@ class Agent:
             rates=rates,
             escape_spikes=self.motor._reflex.escape,
             escape_substep=self.motor._reflex.escape_substep,
+            dan_appetitive_hz=dan_hz[0],
+            dan_aversive_hz=dan_hz[1],
+            dopamine=dopamine,
+            weight_delta=weight_delta,
         )
         self._ms_total += report.ms_total
         self._ms_lif += report.ms_lif
