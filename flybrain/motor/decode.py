@@ -44,16 +44,53 @@ class MotorParams:
     #: Full-scale turn for a fully lateralised steering differential.
     turn_gain: float = math.pi / 2
     eps: float = 1e-6
-    #: Pooled rate mapping to `drive == 1.0`.
-    drive_max_hz: float = 40.0
-    run_drive: float = 0.5
-    reverse_hz: float = 20.0
-    discrete_hz: float = 20.0
+    #: The rate the network actually operates at, and the unit every gate below
+    #: is written in. Absolute Hz thresholds were written against a network
+    #: firing at tens of Hz; the calibrated one sits in a 1-5 Hz band, so
+    #: `drive` pinned at one value and the discrete acts were unreachable. The
+    #: default is the midpoint of `calibrate.DEFAULT_TARGET_HZ` and
+    #: `tests/test_decode.py` pins it there; a live run takes the measured rate
+    #: off the calibration artifact through `for_band`, so the decoder and the
+    #: band cannot drift apart.
+    scale_hz: float = 3.0
+    #: Multiple of `scale_hz` mapping to `drive == 1.0`. Above 1 so the operating
+    #: point lands mid-range and `body.round(drive * max_tiles)` has room either side.
+    drive_max_scale: float = 2.0
+    reverse_scale: float = 1.5
+    #: Floor under the burst gate: below this a pool is too quiet for its own
+    #: ratio to mean anything. The burst is what actually selects the act.
+    discrete_scale: float = 0.5
     refractory_ticks: int = 2
     #: How far above its own running baseline a population must fire to count
     #: as a burst rather than the tonic floor every neuron now sits at.
     burst_ratio: float = 2.0
     baseline_alpha: float = 0.3
+
+    @property
+    def drive_max_hz(self) -> float:
+        return self.scale_hz * self.drive_max_scale
+
+    @property
+    def reverse_hz(self) -> float:
+        return self.scale_hz * self.reverse_scale
+
+    @property
+    def discrete_hz(self) -> float:
+        return self.scale_hz * self.discrete_scale
+
+    @classmethod
+    def for_band(
+        cls, band: tuple[float, float], measured_hz: float | None = None, **overrides: float
+    ) -> MotorParams:
+        """Scaled to the network a calibration describes.
+
+        `measured_hz` is the rate that network was observed at and is preferred:
+        the band is what was accepted, the measurement is what exists. Without
+        one the band's midpoint is the best available guess.
+        """
+        lo, hi = band
+        scale = measured_hz if measured_hz else (lo + hi) / 2
+        return cls(scale_hz=float(scale), **overrides)
 
 
 @dataclass(slots=True)

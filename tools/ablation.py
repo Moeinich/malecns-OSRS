@@ -890,6 +890,7 @@ def build_agent(stack: Stack, condition: str, seed: int, client: BridgeClient) -
         encoder=default_encoder(connectome, calibration.encode_params()),
         params=AgentParams(substeps_per_subframe=stack.substeps, dry_run=stack.dry_run),
         tonic=calibration.tonic_drive(connectome.n),
+        calibration=calibration,
         reward=reward,
     )
 

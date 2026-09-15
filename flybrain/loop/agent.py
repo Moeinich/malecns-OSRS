@@ -15,18 +15,19 @@ from __future__ import annotations
 import sys
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import scipy.sparse as sp
 
 from flybrain.connectome.loader import Connectome
+from flybrain.engine.calibration import Calibration
 from flybrain.engine.lif import LIFEngine
 from flybrain.engine.plasticity import Plasticity
 from flybrain.loop.client import BridgeClient
 from flybrain.loop.types import Action, StateUpdate
 from flybrain.motor.body import BodyParams, to_action
-from flybrain.motor.decode import EgocentricCommand, MotorIndex, decode
+from flybrain.motor.decode import EgocentricCommand, MotorIndex, MotorParams, decode
 from flybrain.reward import RewardRouter
 from flybrain.sensory.collision import CollisionGrid
 from flybrain.sensory.heading import Heading
@@ -92,6 +93,22 @@ class TickReport:
         return self.action.kind
 
 
+def scale_motor(motor: MotorIndex, calibration: Calibration | None) -> MotorIndex:
+    """`motor` with its thresholds written in the calibrated network's own units.
+
+    The decoder's gates are multiples of an operating rate, and the only honest
+    source for that rate is the artifact the engine is running: an uncalibrated
+    run is left alone, since its rates describe no network.
+    """
+    if calibration is None or not calibration.calibrated:
+        return motor
+    acceptance, rates = calibration.acceptance, calibration.rates
+    if acceptance is None:
+        return motor
+    params = MotorParams.for_band(acceptance.target_hz, None if rates is None else rates.mean_hz)
+    return replace(motor, params=params)
+
+
 def default_encoder(connectome: Connectome, params: object | None = None) -> Encoder:
     """The real encoder, bound to one connectome. Needs the annotations feather."""
     from flybrain.sensory.encode import EncodeParams, encode
@@ -114,13 +131,17 @@ class Agent:
         params: AgentParams | None = None,
         body_params: BodyParams | None = None,
         tonic: np.ndarray | None = None,
+        calibration: Calibration | None = None,
         spike_sink: Callable[[np.ndarray], None] | None = None,
         reward: RewardRouter | None = None,
         plasticity: Plasticity | None = None,
     ) -> None:
         self.client = client
         self.engine = engine
-        self.motor = motor
+        #: The decoder's thresholds are multiples of the rate the network is
+        #: calibrated to, taken from the artifact the engine is running rather
+        #: than written down twice.
+        self.motor = scale_motor(motor, calibration)
         self.collision = collision
         self.encoder = encoder
         self.retina = retina if retina is not None else Retina()

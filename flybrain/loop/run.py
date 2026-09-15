@@ -132,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         encoder=default_encoder(connectome, calibration.encode_params()),
         params=AgentParams(substeps_per_subframe=args.substeps, dry_run=args.dry_run),
         tonic=calibration.tonic_drive(connectome.n),
+        calibration=calibration,
         spike_sink=hud.record_spikes if hud is not None and hud.enabled else None,
         reward=reward,
         plasticity=plasticity,

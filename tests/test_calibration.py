@@ -16,6 +16,7 @@ from flybrain.engine.calibration import (
     StaleCalibration,
 )
 from flybrain.engine.calibration import load as load_calibration
+from flybrain.motor.decode import MotorIndex
 
 
 def _connectome(n: int = 6, scale: float = 1.0) -> Connectome:
@@ -26,6 +27,12 @@ def _connectome(n: int = 6, scale: float = 1.0) -> Connectome:
         populations={"L1": np.arange(2), "DNp01": np.arange(2, 4)},
         provenance={"dataset": "test v0"},
     )
+
+
+def _motor() -> MotorIndex:
+    """A real MotorIndex: `scale_motor` rescales it, so a `None` stub hides the wiring."""
+    empty = np.zeros(0, dtype=np.int64)
+    return MotorIndex(*(empty,) * 8)
 
 
 def _calibration(connectome: Connectome) -> Calibration:
@@ -132,9 +139,11 @@ def test_the_live_path_builds_its_engine_and_encoder_from_the_calibration(tmp_pa
     monkeypatch.setattr(run_module, "load", lambda _p: connectome)
     monkeypatch.setattr(run_module, "LIFEngine", fake_engine)
     monkeypatch.setattr(run_module, "default_encoder", fake_encoder)
-    monkeypatch.setattr(run_module.Agent, "run", lambda self, ticks=None: iter(()))
+    monkeypatch.setattr(
+        run_module.Agent, "run", lambda self, ticks=None: seen.update(motor=self.motor) or iter(())
+    )
     monkeypatch.setattr(run_module.CollisionGrid, "load", classmethod(lambda cls, p: None))
-    monkeypatch.setattr(run_module.MotorIndex, "from_connectome", lambda c: None)
+    monkeypatch.setattr(run_module.MotorIndex, "from_connectome", lambda c: _motor())
     monkeypatch.setattr(run_module.BridgeClient, "__enter__", lambda self: self)
     monkeypatch.setattr(run_module.BridgeClient, "__exit__", lambda self, *a: False)
 
@@ -149,6 +158,11 @@ def test_the_live_path_builds_its_engine_and_encoder_from_the_calibration(tmp_pa
     }
     assert seen["encode_params"].i_max == 24.0
     np.testing.assert_allclose(seen["W"].data, connectome.W.data * np.float32(2.0334), rtol=1e-6)
+    # The decoder's gates are multiples of the rate the network was measured at,
+    # so the artifact has to reach the MotorIndex too, not just the engine.
+    motor = seen["motor"]
+    assert isinstance(motor, MotorIndex)
+    assert motor.params.scale_hz == pytest.approx(1.75)
 
 
 def test_a_run_without_an_artifact_says_so_and_runs_raw(tmp_path, monkeypatch, capsys):

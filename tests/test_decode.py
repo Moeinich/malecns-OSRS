@@ -6,6 +6,10 @@ from pathlib import Path
 
 import numpy as np
 
+from flybrain.engine.calibrate import DEFAULT_TARGET_HZ, Acceptance, RateSummary
+from flybrain.engine.calibration import UNCALIBRATED, Calibration, Fingerprint
+from flybrain.loop.agent import scale_motor
+from flybrain.motor.body import BodyParams
 from flybrain.motor.decode import EgocentricCommand, MotorIndex, MotorParams, decode
 
 N = 40
@@ -27,8 +31,9 @@ SLOTS = {
 
 def _index(**overrides) -> MotorIndex:
     kwargs = {k: np.array(v, dtype=np.int64) for k, v in SLOTS.items()}
+    kwargs["params"] = PARAMS
     kwargs.update(overrides)
-    return MotorIndex(params=PARAMS, **kwargs)
+    return MotorIndex(**kwargs)
 
 
 def _rates(**pools) -> np.ndarray:
@@ -128,7 +133,7 @@ def test_refractory_suppresses_a_repeat_inside_the_window():
     assert not decode(rates, motor).attack
     # Past the window, but the same rate is now this pool's own baseline, so it
     # takes a fresh burst above it rather than merely holding the old rate.
-    assert decode(_rates(attack=4 * PARAMS.discrete_hz), motor).attack
+    assert decode(_rates(attack=10 * PARAMS.discrete_hz), motor).attack
 
 
 def test_below_threshold_is_no_act():
@@ -274,3 +279,75 @@ def test_a_discrete_act_at_its_own_baseline_does_not_trip():
     fired = [decode(rates, motor).attack for _ in range(30)]
     assert fired[0]
     assert not any(fired[10:])
+
+
+# ------------------------------------------------- scaled to the calibration
+
+#: The band `calibrate` accepts, and a mean measured inside it.
+BAND = DEFAULT_TARGET_HZ
+MEASURED_HZ = 4.57
+IN_BAND = MotorParams.for_band(BAND, MEASURED_HZ)
+
+
+def _rate_summary(mean_hz: float) -> RateSummary:
+    return RateSummary(
+        mean_hz=mean_hz,
+        median_hz=mean_hz,
+        percentiles_hz={},
+        silent_fraction=0.0,
+        saturated_fraction=0.0,
+        log_mean=0.0,
+        log_std=0.0,
+        bimodality=0.0,
+        histogram=np.zeros(1),
+        bin_edges_hz=np.zeros(2),
+    )
+
+
+def test_the_decoder_scale_tracks_the_calibration_band():
+    """Absolute thresholds are the bug; these two must move together or not at all."""
+    lo, hi = BAND
+    assert MotorParams().scale_hz == (lo + hi) / 2
+    assert MotorParams.for_band(BAND).scale_hz == MotorParams().scale_hz
+    assert IN_BAND.drive_max_hz == MEASURED_HZ * IN_BAND.drive_max_scale
+    assert IN_BAND.discrete_hz == MEASURED_HZ * IN_BAND.discrete_scale
+
+
+def test_scale_motor_reads_the_rate_off_the_calibration_artifact():
+    calibration = Calibration(
+        **{
+            **vars(UNCALIBRATED),
+            "connectome": Fingerprint(n=1, nnz=1, weight_sum=1.0),
+            "acceptance": Acceptance(),
+            "rates": _rate_summary(MEASURED_HZ),
+        }
+    )
+    assert scale_motor(_index(), calibration).params.scale_hz == MEASURED_HZ
+    assert scale_motor(_index(), None).params is PARAMS
+    assert scale_motor(_index(), UNCALIBRATED).params is PARAMS
+
+
+def test_drive_is_graded_across_the_calibrated_band():
+    """A decoder whose whole output sits in one `round()` bucket is not a decoder."""
+    lo, hi = BAND
+    drives = [
+        decode(_rates(drive=hz), _index(params=IN_BAND)).drive for hz in np.linspace(lo, hi, 9)
+    ]
+    assert drives == sorted(drives)
+    # Below this `round(drive * max_tiles)` is 0 and the bot does not move at all.
+    assert drives[0] > 0.5 / BodyParams().max_tiles
+    assert drives[-1] < 1.0
+    assert drives[-1] - drives[0] > 0.3
+
+
+def test_the_measured_rate_lands_mid_range_rather_than_against_a_stop():
+    drive = decode(_rates(drive=MEASURED_HZ), _index(params=IN_BAND)).drive
+    assert 0.4 < drive < 0.6
+
+
+def test_attack_is_reachable_at_in_band_rates():
+    """`discrete_hz` was unreachable for a 1-5 Hz network; every act was dead."""
+    motor = _index(params=IN_BAND)
+    for _ in range(10):
+        decode(_rates(attack=2.0), motor)
+    assert decode(_rates(attack=8.0), motor).attack
