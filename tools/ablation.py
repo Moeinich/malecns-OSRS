@@ -23,18 +23,30 @@ import statistics
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from flybrain.connectome.loader import DEFAULT_PATH, load
+from flybrain.connectome.loader import DEFAULT_PATH, Connectome, load
+from flybrain.connectome.select import (
+    MOTION_DETECTOR_TYPES,
+    ON_RELAY_TYPES,
+    VISUAL_INPUT_TYPES,
+)
 from flybrain.engine.calibration import DEFAULT_CALIBRATION_PATH, UNCALIBRATED, Calibration
 from flybrain.engine.calibration import load as load_calibration
 from flybrain.engine.lif import LIFEngine
-from flybrain.loop.agent import DEFAULT_TICK_MS, Ablation, Agent, AgentParams, default_encoder
+from flybrain.loop.agent import (
+    DEFAULT_TICK_MS,
+    Ablation,
+    Agent,
+    AgentParams,
+    _population,
+    default_encoder,
+)
 from flybrain.loop.client import BridgeClient, default_socket_path
 from flybrain.loop.types import StateUpdate
 from flybrain.motor.decode import MotorIndex
@@ -67,13 +79,15 @@ SCALAR_METRICS = (
 #: Recorded in every report rather than papered over. Both are live as of writing.
 CAVEATS = (
     (
-        "The brain overruns its tick (~706 ms against a 360 ms deadline) and runs ~300 substeps "
-        "instead of 600, so it simulates roughly half the biological time it reports. Scored "
-        "numbers taken before that fix lands are provisional."
+        "The brain overruns its tick on some ticks (84-111 ms of work against a 90 ms deadline "
+        "at NODE_TICKRATE=150) and the encoder drive goes stale on those. It applies equally to "
+        "every condition so it cannot bias the contrast; `overrun_fraction` is per condition."
     ),
     (
-        "The decoded steering differential is small (+0.21 / -0.32 Hz), so directed movement "
-        "may be weak and the steering metrics (distance, tortuosity) correspondingly noisy."
+        "The decoded drive sits near 0.10 with a steering differential of about +/-0.1 rad, so "
+        "directed movement is slow and the steering metrics (distance, tortuosity) are "
+        "correspondingly noisy. Zero kills in every condition is a result about the decoder's "
+        "dynamic range, not a broken harness."
     ),
 )
 
@@ -104,6 +118,15 @@ class StackDown(RuntimeError):
 # ------------------------------------------------------------------ conditions
 
 
+#: Friendly lesion names that stand for a whole set of populations. A lesion
+#: name is otherwise a cell type, and "optic" is not one. The optic lobe is the
+#: 14 types `select.py` forces into the subgraph — the same grouping `hud.py`
+#: colours as one legend entry — taken from there rather than restated here.
+POPULATION_GROUPS: dict[str, tuple[str, ...]] = {
+    "optic": MOTION_DETECTOR_TYPES + VISUAL_INPUT_TYPES + ON_RELAY_TYPES,
+}
+
+
 def ablation_for(condition: str, seed: int) -> Ablation:
     """The `Ablation` one condition name means. The shuffle is `agent.py`'s."""
     if condition == BASELINE:
@@ -113,8 +136,21 @@ def ablation_for(condition: str, seed: int) -> Ablation:
     if condition == "shuffle":
         return Ablation(shuffle=True, seed=seed)
     if condition.startswith("lesion:"):
-        return Ablation(lesions=tuple(condition.removeprefix("lesion:").split("+")), seed=seed)
+        names = condition.removeprefix("lesion:").split("+")
+        expanded = tuple(t for n in names for t in POPULATION_GROUPS.get(n, (n,)))
+        return Ablation(lesions=expanded, seed=seed)
     raise ValueError(f"unknown condition {condition!r}; known: {', '.join(DEFAULT_CONDITIONS)}")
+
+
+def validate_conditions(conditions: Sequence[str], connectome: Connectome, seed: int = 0) -> None:
+    """Resolve every condition before any episode runs.
+
+    A name this build has no population for costs a second here instead of
+    twenty minutes of scored data that is then thrown away by the crash.
+    """
+    for condition in conditions:
+        for name in ablation_for(condition, seed).lesions:
+            _population(connectome, name)
 
 
 # ------------------------------------------------------------------ recording
@@ -612,6 +648,27 @@ def to_json(
     )
 
 
+def partial_json(per_condition: dict[str, list[dict[str, float]]], meta: RunMeta) -> dict[str, Any]:
+    """The scores so far, without the cross-condition statistics.
+
+    Written after every condition completes: a crash in condition five then
+    costs one condition rather than every episode scored before it.
+    """
+    return _jsonable(
+        {
+            "meta": vars(meta),
+            "caveats": list(CAVEATS),
+            "episodes": per_condition,
+            "partial": True,
+        }
+    )
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
 def _jsonable(value: Any) -> Any:
     """`nan` and `inf` are real answers here (undefined tortuosity, no attack);
     JSON has no word for them, so they travel as `null`."""
@@ -718,6 +775,10 @@ def run_condition(
                 tick_ms=agent.tick_ms,
                 dropped=lambda c=client: c.dropped_game_ticks,
             )
+            # Before the first state arrives `agent.tick_ms` is only the default,
+            # so the rates would be scored against a tickrate the stack is not
+            # running. Take it again once the episode has seen the handshake.
+            episode = replace(episode, tick_ms=agent.tick_ms)
         finally:
             client.close()
         print(
@@ -767,17 +828,11 @@ def main(argv: list[str] | None = None) -> int:
         learn=False,
         substeps=args.substeps,
     )
-    per_condition: dict[str, list[dict[str, float]]] = {}
-    tick_ms = DEFAULT_TICK_MS
-    for condition in args.conditions:
-        print(f"condition {condition}", file=sys.stderr)
-        runs = run_condition(stack, condition, args.episodes, args.ticks, args.seed)
-        tick_ms = runs[0].tick_ms
-        per_condition[condition] = [metrics(e) for e in runs]
+    validate_conditions(args.conditions, load(args.connectome), args.seed)
 
     calibration = load_calibration(args.calibration) or UNCALIBRATED
     meta = RunMeta(
-        tick_ms=tick_ms,
+        tick_ms=DEFAULT_TICK_MS,
         ticks_per_episode=args.ticks,
         episodes=args.episodes,
         seed=args.seed,
@@ -788,13 +843,23 @@ def main(argv: list[str] | None = None) -> int:
         calibration_params=calibration_params(calibration),
         started=time.strftime("%Y-%m-%dT%H:%M:%S"),
     )
+
+    out_path = Path(args.out) if args.out else None
+    per_condition: dict[str, list[dict[str, float]]] = {}
+    for condition in args.conditions:
+        print(f"condition {condition}", file=sys.stderr)
+        runs = run_condition(stack, condition, args.episodes, args.ticks, args.seed)
+        meta = replace(meta, tick_ms=runs[0].tick_ms)
+        per_condition[condition] = [metrics(e) for e in runs]
+        if out_path:
+            write_json(out_path, partial_json(per_condition, meta))
+            print(f"wrote {len(per_condition)} condition(s) to {out_path}", file=sys.stderr)
+
     computed = effects(per_condition, seed=args.seed)
     print(report(per_condition, computed, meta))
-    if args.out:
-        path = Path(args.out)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(to_json(per_condition, computed, meta), indent=2) + "\n")
-        print(f"wrote {path}", file=sys.stderr)
+    if out_path:
+        write_json(out_path, to_json(per_condition, computed, meta))
+        print(f"wrote {out_path}", file=sys.stderr)
     return 0
 
 

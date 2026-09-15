@@ -7,6 +7,7 @@ both directions, and that a dead stack raises instead of scoring zeros.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 
@@ -29,10 +30,13 @@ from tools.ablation import (
     effects,
     hedges_g,
     metrics,
+    partial_json,
     record_episode,
     report,
     shuffle_verdict,
     to_json,
+    validate_conditions,
+    write_json,
 )
 
 # ------------------------------------------------------------------ fixtures
@@ -156,6 +160,33 @@ def test_condition_names_map_to_the_ablations_agent_already_implements():
     assert ablation_for("lesion:DNp01", 0).lesions == ("DNp01",)
     with pytest.raises(ValueError, match="unknown condition"):
         ablation_for("lesion-DNp01", 0)
+
+
+def test_a_friendly_lesion_name_expands_to_every_population_it_stands_for():
+    lesions = ablation_for("lesion:optic", 0).lesions
+    assert set(lesions) == {
+        *("T4", "T5", "L1", "L2", "L3", "L5", "Tm1", "Tm3"),
+        *("Mi1", "Mi4", "Mi9", "C2", "C3", "CT1"),
+    }
+    assert ablation_for("lesion:optic+DNp01", 0).lesions[-1] == "DNp01"
+
+
+class FakeConnectome:
+    """A build that knows one population, so every optic type is missing."""
+
+    def __init__(self):
+        self.populations = {"DNp01": [0]}
+
+    def population(self, name, side=None):
+        return self.populations[name]
+
+
+def test_every_condition_is_resolved_before_any_episode_runs():
+    validate_conditions(["real", "shuffle", "lesion:DNp01"], FakeConnectome())
+    with pytest.raises(KeyError, match="no population 'T4' in this build; have: DNp01"):
+        validate_conditions(["real", "lesion:optic"], FakeConnectome())
+    with pytest.raises(ValueError, match="unknown condition"):
+        validate_conditions(["nonsense"], FakeConnectome())
 
 
 # ------------------------------------------------------------------- scoring
@@ -460,3 +491,39 @@ def test_undefined_metrics_travel_as_null_not_as_zero():
     }
     payload = to_json(per_condition, effects(per_condition, seed=0, reps=200), meta())
     assert json.loads(json.dumps(payload))["episodes"]["real"][0]["tortuosity"] is None
+
+
+def test_each_condition_is_written_as_it_completes(tmp_path):
+    out = tmp_path / "nested" / "ablation.json"
+    per_condition = {"real": runs([1.0, 2.0], "xp_per_hr")}
+    write_json(out, partial_json(per_condition, meta()))
+    first = json.loads(out.read_text())
+    assert first["partial"] is True
+    assert list(first["episodes"]) == ["real"]
+
+    per_condition["shuffle"] = runs([3.0, 4.0], "xp_per_hr")
+    write_json(out, partial_json(per_condition, meta()))
+    assert list(json.loads(out.read_text())["episodes"]) == ["real", "shuffle"]
+
+
+def test_the_tickrate_is_taken_after_the_episode_not_before_the_handshake():
+    """`agent.tick_ms` is the 600 ms default until the sidecar says otherwise."""
+
+    class LateAgent:
+        tick_ms = 600
+
+        def tick(self, update):
+            self.tick_ms = 150
+            return FakeReport("walk")
+
+    agent = LateAgent()
+    episode = record_episode(
+        [update(i, player()) for i in range(3)],
+        agent.tick,
+        condition="real",
+        seed=0,
+        ticks=3,
+        tick_ms=agent.tick_ms,
+    )
+    assert episode.tick_ms == 600, "the value read before the handshake is the stale one"
+    assert dataclasses.replace(episode, tick_ms=agent.tick_ms).tick_ms == 150
