@@ -12,9 +12,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-BASE_URL = (
-    "https://storage.googleapis.com/flyem-male-cns/v1.0/connectome-data/flat-connectome/"
-)
+BASE_URL = "https://storage.googleapis.com/flyem-male-cns/v1.0/connectome-data/flat-connectome/"
 FILES = [
     "connectome-weights-male-cns-v1.0-minconf-0.5.feather",
     "body-annotations-male-cns-v1.0-minconf-0.5.feather",
@@ -112,7 +110,9 @@ def verify(name: str, expected_sha256: str | None) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", help="Fetch only this file name")
-    parser.add_argument("--verify-only", action="store_true", help="Verify existing files, no download")
+    parser.add_argument(
+        "--verify-only", action="store_true", help="Verify existing files, no download"
+    )
     parser.add_argument(
         "--write-checksums", action="store_true", help="Record SHA256 of downloaded files"
     )
