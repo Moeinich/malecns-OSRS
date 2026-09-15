@@ -1,0 +1,369 @@
+/**
+ * The sidecar owns the rs-sdk connection and speaks NDJSON over a unix socket.
+ *
+ * Startup order is fixed: listen -> warm pathfinding -> connect the gateway ->
+ * emit `ready`. Connecting before warming risks missed pings killing the socket.
+ */
+import type { Socket } from "bun";
+import { mkdir, unlink } from "node:fs/promises";
+import { dirname } from "node:path";
+import { ActionDispatcher } from "./action-dispatch.ts";
+import { loadConfig, loadSdk, type Bot, type BridgeConfig, type Sdk } from "./config.ts";
+import {
+    PROTOCOL_VERSION,
+    encode,
+    parseClientMsg,
+    type AckMsg,
+    type MotorAction,
+    type ReadyMsg,
+    type Role,
+    type ServerMsg,
+} from "./protocol.ts";
+import { login, awaitRespawn } from "./scaffold.ts";
+import { StateNormalizer, type Observation } from "./state-normalize.ts";
+
+interface ClientCtx {
+    id: number;
+    role: Role | null;
+    buffer: string;
+    /** Unwritten tail: a state message exceeds one socket write, and the rest is lost otherwise. */
+    outbox: Uint8Array;
+}
+
+const ENCODER = new TextEncoder();
+
+type ClientSocket = Socket<ClientCtx>;
+
+const log = (message: string) => console.error(`[bridge] ${message}`);
+
+class Sidecar {
+    private readonly normalizer = new StateNormalizer();
+    private readonly clients = new Set<ClientSocket>();
+    private readonly deadlineMs: number;
+    private dispatcher!: ActionDispatcher;
+    private ready: ReadyMsg | null = null;
+    private nextClientId = 1;
+
+    private revision = 0;
+    private cycle: { revision: number; commanded: boolean; timer: ReturnType<typeof setTimeout> } | null = null;
+    private pending: Observation | null = null;
+    private droppedSinceLast = 0;
+    /** The game tick the open (or last) cycle answered: at most one action per tick. */
+    private lastCycleTick = -1;
+    private awaitingRespawn = false;
+
+    /** Health counters, for the dashboard. */
+    readonly health = { droppedStates: 0, brainOverrun: 0, opRejected: 0 };
+
+    constructor(private readonly cfg: BridgeConfig) {
+        this.deadlineMs = Math.round(cfg.tickMs * cfg.deadlineFraction);
+    }
+
+    async start(): Promise<{ sdk: Sdk; bot: Bot }> {
+        await this.listen();
+
+        const { BotSDK, BotActions, initPathfinding } = await loadSdk(this.cfg);
+        const warmStart = Date.now();
+        initPathfinding();
+        log(`pathfinding warm in ${Date.now() - warmStart} ms`);
+
+        const sdk = new BotSDK({
+            botUsername: this.cfg.username,
+            password: this.cfg.password,
+            gatewayUrl: this.cfg.gatewayUrl,
+            connectionMode: this.cfg.mode,
+            autoLaunchBrowser: false,
+        });
+        const bot = new BotActions(sdk);
+        this.dispatcher = new ActionDispatcher(sdk);
+        await login(sdk, bot, log);
+
+        sdk.onStateUpdate((raw) => this.onState(sdk, raw));
+        this.ready = {
+            t: "ready",
+            protocol: PROTOCOL_VERSION,
+            username: this.cfg.username,
+            mode: this.cfg.mode,
+            role: "brain",
+            tickMs: this.cfg.tickMs,
+            pathfindingWarm: true,
+        };
+        this.broadcast(this.ready);
+        log(`ready on ${this.cfg.socketPath}`);
+        return { sdk, bot };
+    }
+
+    private async listen(): Promise<void> {
+        await mkdir(dirname(this.cfg.socketPath), { recursive: true });
+        await unlink(this.cfg.socketPath).catch(() => {});
+        Bun.listen<ClientCtx>({
+            unix: this.cfg.socketPath,
+            socket: {
+                open: (socket) => {
+                    socket.data = { id: this.nextClientId++, role: null, buffer: "", outbox: new Uint8Array(0) };
+                    this.clients.add(socket);
+                },
+                close: (socket) => {
+                    this.clients.delete(socket);
+                },
+                drain: (socket) => {
+                    this.flush(socket);
+                },
+                error: (socket, error) => {
+                    log(`client ${socket.data.id} error: ${error.message}`);
+                    this.clients.delete(socket);
+                },
+                data: (socket, chunk) => {
+                    socket.data.buffer += chunk.toString();
+                    const lines = socket.data.buffer.split("\n");
+                    socket.data.buffer = lines.pop() ?? "";
+                    for (const line of lines) {
+                        if (line.trim()) void this.onLine(socket, line);
+                    }
+                },
+            },
+        });
+    }
+
+    private async onLine(socket: ClientSocket, line: string): Promise<void> {
+        const msg = parseClientMsg(line);
+        if (!msg) return this.send(socket, { t: "error", message: "malformed message" });
+
+        if (msg.t === "hello") {
+            if (msg.role === "brain" && [...this.clients].some((c) => c !== socket && c.data.role === "brain")) {
+                return this.send(socket, { t: "error", message: "a brain is already attached" });
+            }
+            socket.data.role = msg.role;
+            if (this.ready) this.send(socket, { ...this.ready, role: msg.role });
+            return;
+        }
+
+        const cmdId = msg.t === "cmd" ? msg.cmdId : -1;
+        if (socket.data.role !== "brain") {
+            return this.ack(socket, cmdId, false, "role", 0, "observe clients cannot act");
+        }
+        // Stale-revision rejection: the brain answered a world that no longer exists.
+        if (!this.cycle || this.cycle.revision !== msg.revision) {
+            return this.ack(socket, cmdId, false, "stale", 0, `current revision ${this.cycle?.revision ?? "none"}`);
+        }
+        // At most one action per tick.
+        if (this.cycle.commanded) {
+            return this.ack(socket, cmdId, false, "duplicate", 0, "this revision was already answered");
+        }
+
+        this.cycle.commanded = true;
+        clearTimeout(this.cycle.timer);
+
+        if (msg.t === "noop") return this.closeCycle();
+
+        const dispatch = await this.dispatcher.dispatch(msg.action);
+        this.closeCycle();
+        if (!dispatch.ok) {
+            return this.ack(socket, msg.cmdId, false, dispatch.phase, 0, dispatch.message);
+        }
+        // The ack lands a tick later, carrying the observed truth rather than
+        // "bytes were written" - a refused op is silent on the wire.
+        const outcome = await dispatch.verified;
+        this.health.opRejected += outcome.opRejectedDelta;
+        this.ack(socket, msg.cmdId, outcome.ok, outcome.phase, outcome.opRejectedDelta, outcome.message);
+    }
+
+    private onState(sdk: Sdk, raw: Parameters<Parameters<Sdk["onStateUpdate"]>[0]>[0]): void {
+        if (raw.player?.isDead) {
+            if (!this.awaitingRespawn) {
+                this.awaitingRespawn = true;
+                void awaitRespawn(sdk, log).finally(() => {
+                    this.awaitingRespawn = false;
+                });
+            }
+            return;
+        }
+        // Conflation, depth 1: hold exactly one pending state, never a queue.
+        // A queue would put the brain progressively behind reality while it
+        // believes it is current.
+        if (this.pending) {
+            this.droppedSinceLast++;
+            this.health.droppedStates++;
+        }
+        this.pending = this.normalizer.normalize(raw);
+        this.beginIfDue();
+    }
+
+    /** The SDK republishes several times per game tick; the brain acts on the first of each. */
+    private beginIfDue(): void {
+        if (this.cycle || !this.pending || this.pending.state.tick === this.lastCycleTick) return;
+        const observation = this.pending;
+        this.pending = null;
+        this.lastCycleTick = observation.state.tick;
+        this.beginCycle(observation);
+    }
+
+    private beginCycle(observation: Observation): void {
+        const revision = ++this.revision;
+        const dropped = this.droppedSinceLast;
+        this.droppedSinceLast = 0;
+        this.cycle = {
+            revision,
+            commanded: false,
+            timer: setTimeout(() => void this.onDeadline(revision), this.deadlineMs),
+        };
+        this.broadcast({
+            t: "state",
+            revision,
+            tick: observation.state.tick,
+            droppedSinceLast: dropped,
+            deadlineMs: this.deadlineMs,
+            state: observation.state,
+        });
+        if (observation.combatEvents.length > 0 || Object.keys(observation.xpDelta).length > 0) {
+            this.broadcast({
+                t: "reward",
+                revision,
+                combatEvents: observation.combatEvents,
+                xpDelta: observation.xpDelta,
+            });
+        }
+    }
+
+    /** The brain missed its deadline: repeat the last locomotion rather than block the gateway. */
+    private async onDeadline(revision: number): Promise<void> {
+        if (!this.cycle || this.cycle.revision !== revision || this.cycle.commanded) return;
+        this.cycle.commanded = true;
+        this.health.brainOverrun++;
+        const action: MotorAction = this.dispatcher.continuation();
+        if (action.kind === "idle") return this.closeCycle();
+        const dispatch = await this.dispatcher.dispatch(action);
+        this.closeCycle();
+        this.health.opRejected += (await dispatch.verified).opRejectedDelta;
+    }
+
+    private closeCycle(): void {
+        if (this.cycle) clearTimeout(this.cycle.timer);
+        this.cycle = null;
+        this.beginIfDue();
+    }
+
+    private ack(
+        socket: ClientSocket,
+        cmdId: number,
+        ok: boolean,
+        phase: AckMsg["phase"],
+        opRejectedDelta: number,
+        message: string,
+    ): void {
+        this.send(socket, { t: "ack", cmdId, ok, phase, opRejectedDelta, message });
+    }
+
+    private send(socket: ClientSocket, msg: ServerMsg): void {
+        this.enqueue(socket, ENCODER.encode(encode(msg)));
+    }
+
+    private broadcast(msg: ServerMsg): void {
+        const line = ENCODER.encode(encode(msg));
+        for (const client of this.clients) {
+            if (client.data.role) this.enqueue(client, line);
+        }
+    }
+
+    private enqueue(socket: ClientSocket, bytes: Uint8Array): void {
+        const tail = socket.data.outbox;
+        const outbox = new Uint8Array(tail.length + bytes.length);
+        outbox.set(tail);
+        outbox.set(bytes, tail.length);
+        socket.data.outbox = outbox;
+        this.flush(socket);
+    }
+
+    private flush(socket: ClientSocket): void {
+        while (socket.data.outbox.length > 0) {
+            const written = socket.write(socket.data.outbox);
+            if (written <= 0) return;
+            socket.data.outbox = socket.data.outbox.subarray(written);
+        }
+    }
+}
+
+/**
+ * Walks the player +5 tiles through the real socket/cmd path, so the lane is
+ * verifiable without a Python client.
+ */
+async function selftest(cfg: BridgeConfig): Promise<never> {
+    /** +5 tiles, with fallbacks: the bot may already be standing against a wall. */
+    const offsets = [
+        [5, 0],
+        [-5, 0],
+        [0, 5],
+        [0, -5],
+    ] as const;
+    let origin: { x: number; z: number } | null = null;
+    let offsetIndex = 0;
+    let cmdId = 0;
+    let ticks = 0;
+    let buffer = "";
+
+    const finish = (code: number, message: string): never => {
+        console.log(message);
+        process.exit(code);
+    };
+    const timeout = setTimeout(() => finish(1, "TIMEOUT: never arrived"), 60_000);
+
+    const socket = await Bun.connect<{}>({
+        unix: cfg.socketPath,
+        socket: {
+            open: (s) => {
+                s.write(JSON.stringify({ t: "hello", protocol: PROTOCOL_VERSION, role: "brain" }) + "\n");
+            },
+            data: (s, chunk) => {
+                buffer += chunk.toString();
+                const lines = buffer.split("\n");
+                buffer = lines.pop() ?? "";
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    const msg = JSON.parse(line) as ServerMsg;
+                    if (msg.t === "ready") {
+                        console.log(`READY ${msg.username} mode=${msg.mode} tickMs=${msg.tickMs} warm=${msg.pathfindingWarm}`);
+                        continue;
+                    }
+                    if (msg.t === "ack" && !msg.ok) {
+                        console.log(`ack cmd=${msg.cmdId} REJECTED phase=${msg.phase} (${msg.message})`);
+                        if (msg.phase === "validation" && ++offsetIndex >= offsets.length) {
+                            clearTimeout(timeout);
+                            finish(1, "FAILED: no walkable direction");
+                        }
+                        continue;
+                    }
+                    if (msg.t !== "state") continue;
+                    const player = msg.state.player;
+                    if (!player) continue;
+                    origin ??= { x: player.x, z: player.z };
+                    const offset = offsets[offsetIndex]!;
+                    const target = { x: origin.x + offset[0], z: origin.z + offset[1] };
+                    ticks++;
+                    console.log(
+                        `tick=${msg.state.tick} rev=${msg.revision} pos=(${player.x}, ${player.z}) ` +
+                            `target=(${target.x}, ${target.z}) dropped=${msg.droppedSinceLast}`,
+                    );
+                    if (player.x === target.x && player.z === target.z) {
+                        clearTimeout(timeout);
+                        finish(0, `ARRIVED at (${player.x}, ${player.z}) after ${ticks} observed ticks`);
+                    }
+                    s.write(
+                        JSON.stringify({
+                            t: "cmd",
+                            cmdId: ++cmdId,
+                            revision: msg.revision,
+                            action: { kind: "walk", x: target.x, z: target.z, running: false },
+                        }) + "\n",
+                    );
+                }
+            },
+        },
+    });
+    socket.data = {};
+    return await new Promise<never>(() => {});
+}
+
+const cfg = loadConfig();
+const sidecar = new Sidecar(cfg);
+await sidecar.start();
+if (process.argv.includes("--selftest")) await selftest(cfg);

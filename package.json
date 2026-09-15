@@ -1,0 +1,13 @@
+{
+  "name": "malecns-osrs-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bridge": "bun bridge/sidecar.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.7.0"
+  }
+}
