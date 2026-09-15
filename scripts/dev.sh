@@ -46,9 +46,11 @@ if port_listening 8888; then
   echo "engine: already listening on 8888, skipping"
 else
   echo "engine: starting (first run packs the cache, can take ~40s)"
+  # env, not a bare assignment prefix: ${VAR:+K=V} expands after bash has parsed
+  # the prefix, so it would be treated as a command name.
   ( cd "$RS_SDK/server/engine" && \
-    BUILD_VERIFY=false ${TICKRATE:+NODE_TICKRATE="$TICKRATE"} \
-    nohup bun run src/app.ts > "$ENGINE_LOG" 2>&1 & disown )
+    nohup env BUILD_VERIFY=false ${TICKRATE:+NODE_TICKRATE="$TICKRATE"} \
+    bun run src/app.ts > "$ENGINE_LOG" 2>&1 & disown )
   if wait_for_log "$ENGINE_LOG" "World ready" 90; then
     ENGINE_STATUS="started"
   else
