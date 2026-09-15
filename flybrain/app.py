@@ -73,9 +73,11 @@ def _client_service(client: str, bot: str) -> Service:
 
     Lite has no renderer by design, so the HUD's game panel is empty under it;
     `browser` is headless Chrome on `/bot`, publishing frames for
-    `flybrain.gamefeed`. It costs a Chromium, which is why it is not the default,
-    and it needs the client bundle built once:
-    `cd vendor/rs-sdk/server/webclient && BUILD_MODE=bot bun run bundle.ts`.
+    `flybrain.gamefeed`. It costs a Chromium, which is why it is not the
+    default, and it needs the client bundle built once
+    (`BUILD_MODE=bot bun run bundle.ts` in `vendor/rs-sdk/server/webclient`);
+    `scripts/webclient-bundle.sh` does that automatically, idempotently, then
+    delegates to `bot-env.sh` for the password.
     """
     prepare = [str(REPO_ROOT / "scripts" / "bot-env.sh"), bot]
     if client == BROWSER:
@@ -88,7 +90,7 @@ def _client_service(client: str, bot: str) -> Service:
             pattern="bridge/game-feed.ts",
             ready="game-feed: ready on",
             ready_timeout=150.0,
-            prepare=prepare,
+            prepare=[str(REPO_ROOT / "scripts" / "webclient-bundle.sh"), bot],
         )
     return Service(
         name="lite",
@@ -386,8 +388,14 @@ class Supervisor:
         return dead
 
     def status(self) -> str:
+        """Every `self.services` entry, plus any state-file row with no match
+        among them — a service started under different flags (e.g. `browser`
+        when invoked without `--client browser`), the way `stop` already
+        tolerates via `order.index(...) if ... else -1`.
+        """
         state = self._load_state()
         rows = [("SERVICE", "TIER", "STATE", "PGID", "PORT", "LOG")]
+        known = {service.name for service in self.services}
         for service in self.services:
             entry = state.get(service.name)
             running = probe(service) is not None
@@ -405,6 +413,21 @@ class Supervisor:
                     str(entry["pgid"]) if entry else "-",
                     str(service.port or "-"),
                     str(service.log_path(self.run_dir)),
+                )
+            )
+        for name, entry in state.items():
+            if name in known:
+                continue
+            alive = group_alive(entry["pgid"])
+            what = ("adopted" if entry.get("adopted") else "ours") if alive else "DEAD"
+            rows.append(
+                (
+                    name,
+                    entry.get("tier", "-"),
+                    f"{what} (not in current flags)",
+                    str(entry["pgid"]),
+                    "-",
+                    entry.get("log", "-"),
                 )
             )
         widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
