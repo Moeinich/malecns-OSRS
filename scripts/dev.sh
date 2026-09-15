@@ -50,7 +50,7 @@ else
   # the prefix, so it would be treated as a command name.
   ( cd "$RS_SDK/server/engine" && \
     nohup env BUILD_VERIFY=false ${TICKRATE:+NODE_TICKRATE="$TICKRATE"} \
-    bun run src/app.ts > "$ENGINE_LOG" 2>&1 & disown )
+    bun run src/app.ts > "$ENGINE_LOG" 2>&1 & disown ) >/dev/null 2>&1 </dev/null
   if wait_for_log "$ENGINE_LOG" "World ready" 90; then
     ENGINE_STATUS="started"
   else
@@ -63,7 +63,7 @@ if port_listening 7780; then
   echo "gateway: already listening on 7780, skipping"
 else
   echo "gateway: starting"
-  ( cd "$RS_SDK/server/gateway" && nohup bun run gateway > "$GATEWAY_LOG" 2>&1 & disown )
+  ( cd "$RS_SDK/server/gateway" && nohup bun run gateway > "$GATEWAY_LOG" 2>&1 & disown ) >/dev/null 2>&1 </dev/null
   if wait_for_log "$GATEWAY_LOG" "Gateway running" 30; then
     GATEWAY_STATUS="started"
   else
@@ -79,7 +79,7 @@ else
   echo "lite client ($BOT_NAME): starting"
   "$REPO_ROOT/scripts/bot-env.sh" "$BOT_NAME"
   ( cd "$RS_SDK/server/webclient" && \
-    nohup bun src/lite/runner.ts "$BOT_NAME" > "$LITE_LOG" 2>&1 & disown )
+    nohup bun src/lite/runner.ts "$BOT_NAME" > "$LITE_LOG" 2>&1 & disown ) >/dev/null 2>&1 </dev/null
   if wait_for_log "$LITE_LOG" "Gateway connected, registering as" 30; then
     LITE_STATUS="started"
   else
