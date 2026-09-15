@@ -140,3 +140,15 @@ role = "lamina, ON pathway; takes 1,885 L1 out-edges but is not itself injected 
 required = false
 expect = 2
 role = "two giant wide-field cells, one per optic lobe; the shared inhibitory partner of T4/T5"
+
+[DNa]
+required = false
+match = "prefix"
+expect = 52
+role = "anterior-dorsal DNs incl. DNa01/DNa02 and the DNae extension; the steering pool"
+
+[DNb]
+required = false
+match = "prefix"
+expect = 40
+role = "anterior-ventral DNs incl. DNb02; pooled with DNp09/DNpe017 for forward drive"

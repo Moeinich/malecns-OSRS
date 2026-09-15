@@ -14,16 +14,34 @@ in `motor/body.py` instead.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
 
+log = logging.getLogger(__name__)
+
+#: Descending families pooled for steering, and the reading behind the choice.
+#: This is **our interpretation**, not a MaleCNS annotation: the dataset names
+#: no "steering pool". `DNa*` (DNa01-DNa16 plus the DNae unnamed extension) is
+#: the anterior-dorsal descending family that carries the canonical turning
+#: cells DNa01/DNa02 into the leg neuropils, so it is the population whose
+#: left/right imbalance is read as a turn. DNa02 stays in it as the canonical
+#: member rather than being the whole readout: one cell emits ~2 spikes per
+#: 600 ms tick, so a single-cell differential is Poisson noise.
+STEER_FAMILIES = ("DNa", "DNa02")
+
+#: Forward drive, same caveat. `DNb*` is the anterior-ventral descending family
+#: containing DNb02, already paired with DNp09 in `cell_types.toml`; DNp09 and
+#: DNpe017 stay named so the canonical drive cells are certainly included.
+DRIVE_FAMILIES = ("DNb", "DNp09", "DNpe017")
+
 
 @dataclass(frozen=True, slots=True)
 class MotorParams:
-    #: Full-scale turn for a fully lateralised DNa02 differential.
+    #: Full-scale turn for a fully lateralised steering differential.
     turn_gain: float = math.pi / 2
     eps: float = 1e-6
     #: Pooled rate mapping to `drive == 1.0`.
@@ -32,12 +50,35 @@ class MotorParams:
     reverse_hz: float = 20.0
     discrete_hz: float = 20.0
     refractory_ticks: int = 2
+    #: How far above its own running baseline a population must fire to count
+    #: as a burst rather than the tonic floor every neuron now sits at.
+    burst_ratio: float = 2.0
+    baseline_alpha: float = 0.3
 
 
 @dataclass(slots=True)
 class _Debounce:
     tick: int = 0
     last: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _Baseline:
+    """Running activity floor per readout population, EMA over ticks.
+
+    Absolute thresholds were written when the network was silent, so a single
+    spike meant something. Every neuron now fires at a tonic-driven floor and
+    the absolute thresholds trip together on every tick. A reflex is a
+    deviation from what its own cells were already doing. These levels are
+    derived from the network's own output, never from game state.
+    """
+
+    level: dict[str, float] = field(default_factory=dict)
+
+    def burst(self, name: str, value: float, ratio: float, alpha: float) -> bool:
+        base = self.level.get(name, 0.0)
+        self.level[name] = base + alpha * (value - base)
+        return value > base * ratio
 
 
 @dataclass(slots=True)
@@ -73,6 +114,19 @@ class _Populations(Protocol):
     def population(self, name: str, side: str | None = ...) -> np.ndarray: ...
 
 
+def _pooled(c: _Populations, names: tuple[str, ...], side: str | None = None) -> np.ndarray:
+    """Union of the named families, skipping any this build does not carry."""
+    found = []
+    for name in names:
+        try:
+            found.append(c.population(name, side=side))
+        except KeyError:
+            log.warning("population %r absent from this build; not pooled", name)
+    if not found:
+        return np.array([], dtype=np.int64)
+    return np.unique(np.concatenate(found))
+
+
 @dataclass(frozen=True, slots=True)
 class MotorIndex:
     """Which neurons are read out as what. Built once, never from game state."""
@@ -88,6 +142,7 @@ class MotorIndex:
     params: MotorParams = MotorParams()
     _debounce: _Debounce = field(default_factory=_Debounce)
     _reflex: _Reflex = field(default_factory=_Reflex)
+    _baseline: _Baseline = field(default_factory=_Baseline)
 
     def begin_tick(self) -> None:
         self._reflex.escape = 0
@@ -106,12 +161,20 @@ class MotorIndex:
 
     @classmethod
     def from_connectome(cls, c: _Populations, params: MotorParams | None = None) -> MotorIndex:
+        """Resolve the readout populations by name.
+
+        Steering and drive are pooled over whole descending families
+        (`STEER_FAMILIES`, `DRIVE_FAMILIES`) with a left/right split, because
+        the differential *is* the steering signal and a one-cell-per-side
+        differential is noise. Escape is deliberately not pooled: `DNp01` is
+        one Giant Fiber per side and that is the biology.
+        """
         feeding = c.population("MBON")
         third = len(feeding) // 3
         return cls(
-            steer_left=c.population("DNa02", side="left"),
-            steer_right=c.population("DNa02", side="right"),
-            drive=np.concatenate([c.population("DNp09"), c.population("DNpe017")]),
+            steer_left=_pooled(c, STEER_FAMILIES, side="left"),
+            steer_right=_pooled(c, STEER_FAMILIES, side="right"),
+            drive=_pooled(c, DRIVE_FAMILIES),
             reverse=c.population("MDN"),
             escape=c.population("DNp01"),
             # MaleCNS names no attack/feed descending pool, so the discrete acts
@@ -131,21 +194,24 @@ def _pool(rates: np.ndarray, idx: np.ndarray) -> float:
 def decode(rates: np.ndarray, motor: MotorIndex) -> EgocentricCommand:
     p = motor.params
     d = motor._debounce
+    b = motor._baseline
     d.tick += 1
 
     left, right = _pool(rates, motor.steer_left), _pool(rates, motor.steer_right)
     turn = p.turn_gain * (left - right) / (left + right + p.eps)
 
-    # The Giant Fiber is an all-or-nothing reflex: one spike anywhere in the
-    # tick is the trigger, counted as it happened rather than averaged.
-    escape = motor._reflex.escape > 0
+    # The Giant Fiber is all-or-nothing within a tick, counted as it happened
+    # rather than averaged — but against its own recent rate, since DNp01 fires
+    # at the tonic floor and "any spike at all" is now every tick.
+    escape = b.burst("escape", float(motor._reflex.escape), p.burst_ratio, p.baseline_alpha)
 
     pooled = {
         "attack": _pool(rates, motor.attack),
         "eat": _pool(rates, motor.eat),
         "pickup": _pool(rates, motor.pickup),
     }
-    above = {k: v for k, v in pooled.items() if v >= p.discrete_hz}
+    burst = {k: b.burst(k, v, p.burst_ratio, p.baseline_alpha) for k, v in pooled.items()}
+    above = {k: v for k, v in pooled.items() if v >= p.discrete_hz and burst[k]}
     winner = max(above, key=lambda k: above[k]) if above else None
     if winner is not None:
         if d.tick - d.last.get(winner, -(1 << 30)) < p.refractory_ticks:
