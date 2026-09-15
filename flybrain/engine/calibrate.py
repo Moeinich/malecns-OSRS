@@ -19,11 +19,17 @@ is False with both bracketing points attached. Returning the closest miss as a s
 would hide the one outcome the search exists to detect.
 
 Measured on the real build, that is exactly what happens: the mean rate goes from
-0.07 Hz at gain 2.9131 to 157.8 Hz at 2.91474 — a 0.06% change in gain — and no scalar
-multiplier lands in 1-5 Hz. Worse, the quiet side is *metastable*, not stable: at gain
-2.9131 the network reads 0.07 Hz over 2,000 steps and 27.3 Hz over 8,000, because the
-avalanche takes seconds of simulated time to ignite. So `measure_steps` is part of the
-claim, not a tuning knob — a short window will call a supercritical network silent.
+0.10 Hz at gain 2.03285 to 5.23 Hz at 2.03399 — a 0.06% change in gain — and no scalar
+multiplier holds the band, the upper bracket staying bimodal with 76.6% of cells silent.
+Worse, the quiet side is *metastable*, not stable: the network reads near-zero over
+2,000 steps and tens of Hz over 8,000, because the avalanche takes seconds of simulated
+time to ignite. So `measure_steps` is part of the claim, not a tuning knob — a short
+window will call a supercritical network silent.
+
+These figures are from the corrected, correctly-oriented connectome. An earlier run on a
+transposed matrix put the cliff at gain ~2.9131; fixing the orientation moved it to
+~2.0334 but did not soften it, so the bistability is a property of the network and this
+LIF model, not of that bug.
 """
 
 from __future__ import annotations
