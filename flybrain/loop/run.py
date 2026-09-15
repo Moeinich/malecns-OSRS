@@ -118,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
         collision=CollisionGrid.load(args.collision),
         encoder=default_encoder(connectome, calibration.encode_params()),
         params=AgentParams(substeps_per_subframe=args.substeps, dry_run=args.dry_run),
+        tonic=calibration.tonic_drive(connectome.n),
         spike_sink=hud.record_spikes if hud is not None and hud.enabled else None,
     )
 

@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import os
+from unittest import mock
 
 import numpy as np
 import pytest
 import scipy.sparse as sp
 
 from flybrain.connectome.loader import normalize_incoming
+from flybrain.engine import calibrate as calibrate_module
 from flybrain.engine.calibrate import (
     BIMODALITY_UNIFORM,
     DEFAULT_TONIC_FRACTION,
     DEFAULT_V_REST,
     DEFAULT_V_THRESH,
     FRAME_STEPS,
+    NULL_CLAUSE,
     SATURATION_FRACTION,
     SUBFRAMES_PER_TICK,
     TICK_MS,
@@ -194,7 +197,17 @@ def test_a_network_whose_mean_is_in_band_but_is_mostly_silent_fails_the_search()
     current = np.zeros(n, dtype=np.float32)
     current[: int(n * 0.3)] = 15.5
 
-    result = calibrate_gain(W, drive=current, gain_range=(0.5, 2.0), max_iter=4, **FAST)
+    # `null_margin=0` deliberately: this fixture has no connectome, so the null
+    # clause would catch it first and the shape clauses — what it exists to test —
+    # would never run.
+    result = calibrate_gain(
+        W,
+        drive=current,
+        acceptance=Acceptance(null_margin=0.0),
+        gain_range=(0.5, 2.0),
+        max_iter=4,
+        **FAST,
+    )
 
     assert not result.success
     assert result.measurement is None
@@ -323,3 +336,63 @@ def test_with_tonic_lifts_every_neuron_including_the_undriven():
     lifted = with_tonic(base, 10, 2.0)
     np.testing.assert_allclose(lifted(0), base(0) + 2.0)
     assert with_tonic(base, 10, 0.0) is base
+
+
+def test_a_rate_in_band_that_the_null_also_reaches_is_rejected():
+    """The clause the tonic made necessary: in-band is not evidence of a network."""
+    rng = np.random.default_rng(0)
+    r = summarize_rates(10 ** rng.normal(0.3, 0.2, 2000), max_hz=333.0)
+
+    assert Acceptance().reject(r, None) == []  # every shape clause passes
+    clauses = Acceptance().reject(r, r.mean_hz / 1.25)
+    assert len(clauses) == 1
+    assert clauses[0].startswith(NULL_CLAUSE)
+    assert "1.25x" in clauses[0] and "not contributing" in clauses[0]
+    # The same distribution over a null it clears by the margin is accepted.
+    assert Acceptance().reject(r, r.mean_hz / 1.5) == []
+
+
+def test_a_network_with_no_connectome_is_rejected_however_good_its_rate_looks():
+    """FlyBrain's own failure mode: a noise generator with a graph attached.
+
+    A zero weight matrix under a drive 1 mV short of threshold reads 2.2 Hz mean,
+    2.25 Hz median, 0% silent, unimodal — it passes every other clause in
+    `Acceptance`, at every gain, because the gain multiplies nothing.
+    """
+    n = 800
+    W = _feedforward_net(n)
+    current = np.full(n, np.float32(14.0), dtype=np.float32)
+
+    result = calibrate_gain(W, drive=current, gain_range=(0.01, 10.0), max_iter=4, **HONEST)
+
+    assert not result.success
+    assert result.measurement is None
+    # Every shape clause passes; it is only the null that rejects this.
+    assert 1.0 <= result.upper_bracket.rates.mean_hz <= 5.0
+    assert result.upper_bracket.rates.median_hz > 0.0
+    assert result.upper_bracket.rates.silent_fraction == 0.0
+    assert Acceptance().reject(result.upper_bracket.rates) == []
+    assert NULL_CLAUSE in result.failure
+    # The null is the same network, so no gain can pull away from it.
+    assert result.null.rates.mean_hz == pytest.approx(result.upper_bracket.rates.mean_hz)
+    assert "connectome-free" in format_report(result)
+
+
+def test_the_null_is_measured_once_per_search_not_once_per_bisection():
+    n = 500
+    W = _graded_net(n)
+    drive = _drive(n, background=12.0, sensory=50, active_fraction=0.1)
+    runs: list[float] = []
+    real = calibrate_module.measure_gain
+
+    def counting(W_, gain, drive_, **kw):
+        runs.append(float(W_.nnz))
+        return real(W_, gain, drive_, **kw)
+
+    with mock.patch.object(calibrate_module, "measure_gain", counting):
+        result = calibrate_gain(W, drive=drive, gain_range=(1.0, 30.0), max_iter=12, **HONEST)
+
+    assert result.success, result.failure
+    assert runs.count(0.0) == 1  # exactly one zero-matrix run, whatever the iteration count
+    assert result.null is not None
+    assert result.measurement.rates.mean_hz >= result.null.rates.mean_hz * Acceptance().null_margin

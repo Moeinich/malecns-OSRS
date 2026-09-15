@@ -103,6 +103,7 @@ class Agent:
         heading: Heading | None = None,
         params: AgentParams | None = None,
         body_params: BodyParams | None = None,
+        tonic: np.ndarray | None = None,
         spike_sink: Callable[[np.ndarray], None] | None = None,
     ) -> None:
         self.client = client
@@ -114,6 +115,11 @@ class Agent:
         self.heading = heading if heading is not None else Heading()
         self.params = params if params is not None else AgentParams()
         self.body_params = body_params
+        #: Constant current added to every encoded frame. `LIFEngine` has no tonic
+        #: parameter, so the calibrated floor can only reach the live brain folded
+        #: into the injected current — and if it does not reach it, the calibration
+        #: describes a network this loop never runs.
+        self.tonic = np.float32(0.0) if tonic is None else np.asarray(tonic, dtype=np.float32)
         #: Called with each substep's fired indices. Telemetry only; the loop
         #: never reads it back.
         self.spike_sink = spike_sink
@@ -169,7 +175,7 @@ class Agent:
         overrun = False
         for frame in frames:
             a = time.perf_counter()
-            current = self.encoder(frame)
+            current = self.encoder(frame) + self.tonic
             b = time.perf_counter()
             for k in range(per_subframe):
                 fired = self.engine.step(current)

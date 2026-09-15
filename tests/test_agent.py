@@ -252,13 +252,15 @@ def _script(n_ticks: int, tick_ms: int = 600) -> list[dict]:
 def _agent(sidecar: FakeSidecar, W: sp.csc_matrix, **params) -> Agent:
     connectome = _connectome()
     motor = MotorIndex.from_connectome(connectome, MotorParams())
+    engine_cls = params.pop("engine_cls", LIFEngine)
     return Agent(
         client=BridgeClient(sidecar.path, reconnect=False),
-        engine=LIFEngine(W, seed=1),
+        engine=engine_cls(W, seed=1),
         motor=motor,
         collision=_collision(),
-        encoder=_encoder,
+        encoder=params.pop("encoder", _encoder),
         retina=Retina(),
+        tonic=params.pop("tonic", None),
         params=AgentParams(substeps_per_subframe=params.pop("substeps", None), **params),
     )
 
@@ -557,3 +559,99 @@ def test_a_rate_window_shorter_than_the_tick_is_widened():
 def test_a_pinned_rate_window_shorter_than_the_tick_is_rejected():
     with pytest.raises(ValueError, match="shorter than the 600 ms tick"):
         run_condition(None, n_ticks=1, rate_window_steps=100)
+
+
+# --------------------------------------------------- the tonic reaching the brain
+
+
+class _SpyEngine(LIFEngine):
+    """Records the current the loop actually injects, which is the whole question."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.injected: list[np.ndarray] = []
+
+    def step(self, current):
+        self.injected.append(np.asarray(current, dtype=np.float32).copy())
+        return super().step(current)
+
+
+def test_the_tonic_is_added_to_every_injected_current():
+    """`LIFEngine` has no tonic parameter, so the calibrated floor exists only if
+    the loop folds it into the drive. Calibrating with one and running without it
+    makes the two different networks."""
+    tonic = np.arange(N, dtype=np.float32) * np.float32(0.1)
+    flat = np.full(N, np.float32(2.0), dtype=np.float32)
+    encoder = lambda frame: flat.copy()
+
+    agent, _, _ = run_condition(
+        None, n_ticks=4, engine_cls=_SpyEngine, encoder=encoder, tonic=tonic
+    )
+
+    assert agent.engine.injected
+    for current in agent.engine.injected:
+        np.testing.assert_allclose(current, flat + tonic, atol=1e-5)
+
+    # Without one, nothing silently stands between the encoder and the membrane.
+    bare, _, _ = run_condition(None, n_ticks=4, engine_cls=_SpyEngine, encoder=encoder)
+    assert np.float32(bare.tonic) == np.float32(0.0)
+    for current in bare.engine.injected:
+        np.testing.assert_allclose(current, flat, atol=1e-5)
+
+
+def test_the_live_path_delivers_the_calibrated_tonic_to_the_agent(tmp_path, monkeypatch):
+    """The recurring bug in this codebase is a calibrated value that never arrives."""
+    from flybrain.engine.calibrate import tonic_current
+    from flybrain.engine.calibration import Calibration, Fingerprint
+    from flybrain.loop import run as run_module
+
+    connectome = _connectome()
+    path = Calibration(
+        gain=1.0,
+        tonic_fraction=0.9,
+        connectome=Fingerprint.of(connectome),
+    ).save(tmp_path / "calibration_v1.json")
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(run_module, "load", lambda _p: connectome)
+    monkeypatch.setattr(run_module, "default_encoder", lambda c, params=None: _encoder)
+    monkeypatch.setattr(run_module.Agent, "run", lambda self, ticks=None: iter(()))
+    monkeypatch.setattr(
+        run_module, "Agent", lambda **kw: seen.update(kw) or _NullAgent(**kw), raising=True
+    )
+    monkeypatch.setattr(run_module.CollisionGrid, "load", classmethod(lambda cls, p: None))
+    monkeypatch.setattr(run_module.MotorIndex, "from_connectome", lambda c: None)
+
+    assert run_module.main(["--calibration", str(path), "--ticks", "0"]) == 0
+
+    np.testing.assert_allclose(seen["tonic"], tonic_current(0.9))
+    assert np.asarray(seen["tonic"]).shape == (connectome.n,)
+
+
+class _NullAgent:
+    """Enough of `Agent` for `run.main` to finish without a sidecar."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+        self.ticks = 0
+        self.last = None
+        self.overruns = 0
+        self.action_counts = {}
+        self.mean_ms_per_tick = 0.0
+        self.mean_ms_lif = 0.0
+        self.tick_ms = 600
+        self.substeps_per_subframe = 1
+        self.client = _NullClient()
+
+    def run(self, ticks=None):
+        return iter(())
+
+
+class _NullClient:
+    dropped_game_ticks = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False

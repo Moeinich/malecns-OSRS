@@ -6,7 +6,15 @@ under a uniform drive of mu=12 — 1.1 s per 600 ms tick. Cost is edges touched 
 step, so the firing rate *is* the compute budget, and the usable band has to be found
 deliberately.
 
-Two choices are load-bearing:
+Three choices are load-bearing:
+
+*The accepted point must beat the connectome-free null.* A rate in band is not
+evidence the graph did anything: under the tonic that finally got the median
+neuron firing, a zero weight matrix also scores 1.04 Hz, so the search would have
+reported CALIBRATED at gain 0.001. Every accepted point is now measured against
+the same drive with `W = 0` and has to exceed it by `Acceptance.null_margin`.
+This is the shuffle control's logic applied to the search itself.
+
 
 *The drive is sparse and restricted to the sensory populations*, never uniform. A
 uniform current is exactly what produced the cliff, and it is a regime the real system
@@ -50,7 +58,32 @@ from flybrain.engine.lif import LIFEngine
 
 #: Resting band for fly central neurons. At dt=1 ms, 5 Hz is 0.5% of neurons per
 #: step — a fifth of the 1% benchmark, so in-band is comfortably inside budget.
+#:
+#: Deliberately *not* raised now that the tonic puts a ~1.04 Hz floor under the
+#: band. Raising the floor to clear the null would be the wrong fix twice over:
+#: the band is a claim about fly physiology, not about our drive, and a floor
+#: tuned to sit above today's tonic silently stops being above tomorrow's. The
+#: null is handled where it belongs, by `Acceptance.null_margin`.
 DEFAULT_TARGET_HZ = (1.0, 5.0)
+
+#: How far above the connectome-free null an accepted point has to sit.
+#:
+#: The measurement that forced this clause, on the full 184,110-neuron build
+#: under the default normalisation and tonic:
+#:
+#:     tonic only, W = 0       mean 1.041 Hz, median 1.000
+#:     real W, gain 0.001      mean 1.042 Hz, median 1.000
+#:     real W, gain 0.4        mean 2.729 Hz, median 1.750
+#:
+#: A network with *no connectome whatsoever* scores inside the 1-5 Hz band, so
+#: the search would have reported CALIBRATED at gain 0.001 with the graph
+#: contributing nothing — FlyBrain's own failure mode, a noise generator with a
+#: graph attached. 1.5x is the smallest margin that is unambiguously the network
+#: rather than measurement scatter; the accepted point clears it at 2.6x.
+DEFAULT_NULL_MARGIN = 1.5
+
+#: The name of that clause, so a rejection can be recognised without parsing prose.
+NULL_CLAUSE = "connectome_contribution"
 
 #: A neuron above this fraction of its refractory-limited maximum is saturated.
 SATURATION_FRACTION = 0.5
@@ -166,7 +199,8 @@ class Acceptance:
     judgment call, which is why they are fields and not literals scattered through
     the search.
 
-    `median_hz > 0` is the strongest clause: the median neuron must fire at all.
+    `median_hz > 0` is the strongest clause, and `null_margin` is the one that
+    makes the band mean anything: see `NULL_CLAUSE`.
     """
 
     target_hz: tuple[float, float] = DEFAULT_TARGET_HZ
@@ -175,11 +209,18 @@ class Acceptance:
     max_p99_hz: float = 100.0
     require_median_above_zero: bool = True
     max_bimodality: float = BIMODALITY_UNIFORM
+    null_margin: float = DEFAULT_NULL_MARGIN
 
-    def reject(self, r: RateSummary) -> list[str]:
-        """The clauses this rate distribution fails. Empty means accepted."""
+    def reject(self, r: RateSummary, null_mean_hz: float | None = None) -> list[str]:
+        """The clauses this rate distribution fails. Empty means accepted.
+
+        `null_mean_hz` is the same network's rate with no connectome at all. It is
+        optional only so a bare `RateSummary` can still be tested against the shape
+        clauses; the search always supplies it.
+        """
         lo, hi = self.target_hz
         p99 = r.percentiles_hz[99]
+        contribution = None if not null_mean_hz else r.mean_hz / null_mean_hz
         checks = (
             (not lo <= r.mean_hz <= hi, f"mean_hz {r.mean_hz:.3f} outside {lo}-{hi}"),
             (
@@ -202,6 +243,17 @@ class Acceptance:
                 r.bimodality > self.max_bimodality,
                 f"bimodality {r.bimodality:.3f} > {self.max_bimodality:.3f}",
             ),
+            (
+                contribution is not None and contribution < self.null_margin,
+                (
+                    f"{NULL_CLAUSE}: {r.mean_hz:.3f} Hz is {contribution:.2f}x the "
+                    f"{null_mean_hz:.3f} Hz this drive produces with no connectome at "
+                    f"all, below the {self.null_margin:g}x margin — the connectome is "
+                    f"not contributing"
+                    if contribution is not None
+                    else ""
+                ),
+            ),
         )
         return [why for failed, why in checks if failed]
 
@@ -223,6 +275,10 @@ class CalibrationResult:
     rejected: Measurement | None = None
     lower_bracket: Measurement | None = None
     upper_bracket: Measurement | None = None
+    #: The same drive, tonic, noise and window with a zero weight matrix — what
+    #: this run scores with no connectome at all. Measured only once a mean lands
+    #: in band, because that is the only point whose acceptance it decides.
+    null: Measurement | None = None
     failure: str | None = None
     iterations: int = 0
     threshold_offsets: np.ndarray | None = field(default=None, repr=False)
@@ -446,14 +502,27 @@ def calibrate_gain(
     def run(gain: float) -> Measurement:
         return measure_gain(W, gain, drive_fn, **kw)
 
+    # `drive_fn`, the tonic, the noise and the window are all fixed for the lifetime
+    # of this call, so the null is too: measured once here, never on the bisection
+    # path. This is the cache per (drive, tonic, noise, steps).
+    null_m = measure_gain(sp.csc_matrix((n, n), dtype=np.float32), 1.0, drive_fn, **kw)
+    null_hz = null_m.rates.mean_hz
+
+    # The null does not merely reject at the end — it moves the floor the search is
+    # looking for. Under the tonic the null is 1.04 Hz, inside a 1-5 Hz band, so a
+    # search that stopped at the first in-band mean would stop at gain 1e-3 and
+    # report the connectome missing rather than go and find where it contributes.
+    lo_search = max(lo_band, null_hz * accept.null_margin)
+
     def settle(m: Measurement, iterations: int) -> CalibrationResult:
         """The mean is in band. Whether that is a calibration is a separate question."""
-        clauses = accept.reject(m.rates)
+        clauses = accept.reject(m.rates, null_hz)
         if clauses:
             return CalibrationResult(
                 target_hz=accept.target_hz,
                 success=False,
                 rejected=m,
+                null=null_m,
                 failure=f"mean in band at gain {m.gain:.6g} but rejected: " + "; ".join(clauses),
                 iterations=iterations,
             )
@@ -472,57 +541,80 @@ def calibrate_gain(
             target_hz=accept.target_hz,
             success=True,
             measurement=m,
+            null=null_m,
             iterations=iterations,
             threshold_offsets=offsets,
+        )
+
+    def failed(lo_m, hi_m, why, iterations) -> CalibrationResult:
+        return CalibrationResult(
+            target_hz=accept.target_hz,
+            success=False,
+            lower_bracket=lo_m,
+            upper_bracket=hi_m,
+            null=null_m,
+            failure=why,
+            iterations=iterations,
+        )
+
+    if lo_search > hi_band:
+        return failed(
+            None,
+            None,
+            f"{NULL_CLAUSE}: this drive alone reaches {null_hz:.3f} Hz with no connectome, "
+            f"so {accept.null_margin:g}x it ({lo_search:.3f} Hz) is already past the band's "
+            f"{hi_band} Hz ceiling — no gain in it could be the network's doing",
+            1,
         )
 
     lo, hi = gain_range
     lo_m, hi_m = run(lo), run(hi)
     if lo_m.rates.mean_hz > hi_band:
-        return CalibrationResult(
-            target_hz=accept.target_hz,
-            success=False,
-            lower_bracket=lo_m,
-            upper_bracket=hi_m,
-            failure=f"already above band at the minimum gain {lo:g} "
+        return failed(
+            lo_m,
+            hi_m,
+            f"already above band at the minimum gain {lo:g} "
             f"({lo_m.rates.mean_hz:.2f} Hz) — widen gain_range downward",
-            iterations=2,
+            3,
         )
-    if hi_m.rates.mean_hz < lo_band:
-        return CalibrationResult(
-            target_hz=accept.target_hz,
-            success=False,
-            lower_bracket=lo_m,
-            upper_bracket=hi_m,
-            failure=f"still below band at the maximum gain {hi:g} "
-            f"({hi_m.rates.mean_hz:.2f} Hz) — widen gain_range upward or raise the drive",
-            iterations=2,
+    if hi_m.rates.mean_hz < lo_search:
+        raised = (
+            ""
+            if lo_search <= lo_band
+            else (
+                f" — {NULL_CLAUSE}: the floor here is {lo_search:.3f} Hz, "
+                f"{accept.null_margin:g}x the {null_hz:.3f} Hz this drive reaches with no "
+                f"connectome at all, and the connectome never pulls away from it"
+            )
+        )
+        return failed(
+            lo_m,
+            hi_m,
+            f"still below band at the maximum gain {hi:g} "
+            f"({hi_m.rates.mean_hz:.2f} Hz) — widen gain_range upward or raise the drive" + raised,
+            3,
         )
     for m in (lo_m, hi_m):
-        if lo_band <= m.rates.mean_hz <= hi_band:
-            return settle(m, 2)
+        if lo_search <= m.rates.mean_hz <= hi_band:
+            return settle(m, 3)
 
     for i in range(max_iter):
         mid = float(np.sqrt(lo * hi))
         m = run(mid)
-        if lo_band <= m.rates.mean_hz <= hi_band:
-            return settle(m, 3 + i)
-        if m.rates.mean_hz < lo_band:
+        if lo_search <= m.rates.mean_hz <= hi_band:
+            return settle(m, 4 + i)
+        if m.rates.mean_hz < lo_search:
             lo, lo_m = mid, m
         else:
             hi, hi_m = mid, m
 
-    return CalibrationResult(
-        target_hz=accept.target_hz,
-        success=False,
-        lower_bracket=lo_m,
-        upper_bracket=hi_m,
-        failure=(
-            f"bistable: gain {lo_m.gain:.6g} gives {lo_m.rates.mean_hz:.2f} Hz and "
-            f"{hi_m.gain:.6g} gives {hi_m.rates.mean_hz:.2f} Hz, with the band "
-            f"{lo_band}-{hi_band} Hz never reached after {max_iter} bisections"
-        ),
-        iterations=2 + max_iter,
+    return failed(
+        lo_m,
+        hi_m,
+        f"bistable: gain {lo_m.gain:.6g} gives {lo_m.rates.mean_hz:.2f} Hz and "
+        f"{hi_m.gain:.6g} gives {hi_m.rates.mean_hz:.2f} Hz, with the band "
+        f"{lo_search:.3g}-{hi_band} Hz never reached after {max_iter} bisections",
+        3 + max_iter,
     )
 
 
@@ -589,11 +681,17 @@ def format_report(result: CalibrationResult) -> str:
     ]
     if result.failure:
         lines.append(f"reason           {result.failure}")
+    if result.null is not None:
+        scored = result.measurement or result.rejected
+        null_hz = result.null.rates.mean_hz
+        ratio = f"{scored.rates.mean_hz / null_hz:.2f}x" if scored and null_hz else "n/a"
+        lines.append(f"connectome-free  {null_hz:.3f} Hz null; the point scores {ratio} it")
     for label, m in (
         ("", result.measurement),
         ("rejected point", result.rejected),
         ("lower bracket", result.lower_bracket),
         ("upper bracket", result.upper_bracket),
+        ("connectome-free null", result.null),
     ):
         if m is None:
             continue
@@ -642,6 +740,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--normalize", choices=NORMALIZATION_MODES, default=DEFAULT_NORMALIZATION)
     p.add_argument("--incoming-cap", type=float, default=DEFAULT_INCOMING_CAP)
     p.add_argument("--tonic-fraction", type=float, default=DEFAULT_TONIC_FRACTION)
+    p.add_argument(
+        "--null-margin",
+        type=float,
+        default=DEFAULT_NULL_MARGIN,
+        help="how many times the connectome-free null the accepted rate must be",
+    )
     p.add_argument("--trim-thresholds", action="store_true")
     p.add_argument(
         "--save",
@@ -660,9 +764,10 @@ def main(argv: list[str] | None = None) -> int:
         amplitude=args.amplitude,
         active_fraction=args.active_fraction,
     )
+    acceptance = Acceptance(target_hz=tuple(args.target), null_margin=args.null_margin)
     result = calibrate_gain(
         connectome.W,
-        target_hz=tuple(args.target),
+        acceptance=acceptance,
         drive=drive,
         populations=connectome.populations,
         gain_range=tuple(args.gain_range),
@@ -690,7 +795,7 @@ def main(argv: list[str] | None = None) -> int:
             normalization=args.normalize,
             incoming_cap=args.incoming_cap,
             tonic_fraction=args.tonic_fraction or None,
-            acceptance=Acceptance(target_hz=tuple(args.target)),
+            acceptance=acceptance,
             rates=result.measurement.rates,
             measure_steps=args.measure_steps,
             drive=(
