@@ -43,7 +43,7 @@ export function loadConfig(): BridgeConfig {
         socketPath: env.RS_BRIDGE_SOCKET || `/tmp/malecns-osrs/${username}.sock`,
         mode: env.RS_MODE === "observe" ? "observe" : "control",
         tickMs: Number(env.RS_TICK_MS) || DEFAULT_TICK_MS,
-        deadlineFraction: 0.6,
+        deadlineFraction: Number(env.RS_DEADLINE_FRACTION) || 0.85,
     };
 }
 

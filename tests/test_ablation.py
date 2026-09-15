@@ -15,6 +15,7 @@ import pytest
 
 from flybrain.loop.types import Npc, Player, StateUpdate, WorldState
 from tools.ablation import (
+    DEADLINE_FRACTION,
     SHUFFLE_ABSENT,
     SHUFFLE_BETTER,
     SHUFFLE_DEGENERATE,
@@ -627,7 +628,7 @@ def test_the_overrun_caveat_is_measured_from_the_run_not_hardcoded():
     text = report(per_condition, effects(per_condition, seed=0, reps=200), meta(tick_ms=150))
     assert "94.6 ms / 0.733" in text
     assert "99.0 ms / 1" in text
-    assert "90 ms deadline" in text
+    assert f"{round(150 * DEADLINE_FRACTION)} ms deadline" in text
     assert "LIVE CONFOUND" in text.upper()
     assert "shuffle (1)" in text and "real (0.733)" in text
     assert "not a live confound" not in text
@@ -638,7 +639,7 @@ def test_a_run_that_meets_its_deadline_says_staleness_was_not_a_confound():
     per_condition = {"real": timed(40.0, 0.0), "shuffle": timed(41.0, 0.0)}
     text = report(per_condition, effects(per_condition, seed=0, reps=200), meta(tick_ms=200))
     assert "staleness was not a live confound in THIS run" in text
-    assert "120 ms deadline" in text
+    assert f"{round(200 * DEADLINE_FRACTION)} ms deadline" in text
     assert "IS a live confound" not in text
     assert "applies equally" not in text
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
 import sys
 import time
@@ -78,9 +79,9 @@ SCALAR_METRICS = (
     "mean_ms_per_tick",
 )
 
-#: The sidecar's `deadlineFraction`. Source of truth is bridge/config.ts — restated
-#: rather than imported, so a drift there is findable from here.
-DEADLINE_FRACTION = 0.6
+#: The sidecar's `deadlineFraction`. Source of truth is bridge/config.ts, which
+#: reads the same variable; restated rather than imported so a drift is findable.
+DEADLINE_FRACTION = float(os.environ.get("RS_DEADLINE_FRACTION") or 0.85)
 
 #: An overrun fraction at or below this is not a material confound.
 NEGLIGIBLE_OVERRUN = 0.01
