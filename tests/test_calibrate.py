@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from unittest import mock
 
@@ -11,10 +12,12 @@ from flybrain.connectome.loader import normalize_incoming
 from flybrain.engine import calibrate as calibrate_module
 from flybrain.engine.calibrate import (
     BIMODALITY_UNIFORM,
+    DEFAULT_DT_MS,
+    DEFAULT_SPONTANEOUS_NOISE_STD,
     DEFAULT_TONIC_FRACTION,
     DEFAULT_V_REST,
     DEFAULT_V_THRESH,
-    FRAME_STEPS,
+    FRAME_MS,
     NULL_CLAUSE,
     SATURATION_FRACTION,
     SUBFRAMES_PER_TICK,
@@ -23,19 +26,24 @@ from flybrain.engine.calibrate import (
     calibrate_gain,
     format_report,
     measure_gain,
+    noise_std_for_dt,
     sensory_drive,
+    steps_for,
     summarize_rates,
     tonic_current,
     with_tonic,
 )
 from flybrain.engine.lif import LIFEngine
 
-FAST = {"warmup_steps": 200, "measure_steps": 400}
+#: `dt_ms` is pinned, not defaulted. These fixtures are hand-tuned currents against
+#: a fixed threshold, so they measure the network only at the `dt` they were tuned
+#: at — and `DEFAULT_DT_MS` is a production choice that will move again.
+FAST = {"dt_ms": 1.0, "warmup_steps": 200, "measure_steps": 400}
 #: A 400-step window quantizes rates to 2.5 Hz, so at a 1-5 Hz mean almost every
 #: neuron reads 0 or 1 spikes and the silent fraction measures the window, not the
 #: network. Any test asserting the *acceptance* predicate needs a window that can
 #: resolve the band it is accepting.
-HONEST = {"warmup_steps": 500, "measure_steps": 4000}
+HONEST = {"dt_ms": 1.0, "warmup_steps": 500, "measure_steps": 4000}
 
 
 def _graded_net(n: int = 500, p: float = 0.02, inhibitory: float = 0.2, seed: int = 1):
@@ -166,13 +174,41 @@ def test_sensory_drive_holds_a_pattern_for_a_whole_frame():
     assert np.count_nonzero(drive(0)[20:]) == 0
 
 
-def test_the_drive_frame_is_one_sub_frame_of_a_real_tick():
+@pytest.mark.parametrize("dt_ms", [1.0, 2.0, 3.0])
+def test_the_drive_frame_is_one_sub_frame_of_a_real_tick(dt_ms: float):
     """Calibrating against an input shape the encoder never produces tunes for a
-    network that does not exist, so the default frame is derived from the tick."""
-    assert (TICK_MS, SUBFRAMES_PER_TICK, FRAME_STEPS) == (600, 4, 150)
-    drive = sensory_drive(50, np.arange(20), amplitude=20.0, active_fraction=0.25)
-    assert np.array_equal(drive(0), drive(FRAME_STEPS - 1))
-    assert not np.array_equal(drive(0), drive(FRAME_STEPS))
+    network that does not exist, so the default frame is derived from the tick —
+    in ms, so it stays one sub-frame of held current at every `dt`."""
+    assert (TICK_MS, SUBFRAMES_PER_TICK, FRAME_MS) == (600, 4, 150)
+    steps = steps_for(FRAME_MS, dt_ms)
+    assert steps * dt_ms == pytest.approx(FRAME_MS, abs=dt_ms)
+    drive = sensory_drive(50, np.arange(20), amplitude=20.0, active_fraction=0.25, dt_ms=dt_ms)
+    assert np.array_equal(drive(0), drive(steps - 1))
+    assert not np.array_equal(drive(0), drive(steps))
+
+
+def test_the_default_dt_divides_the_tick_and_the_sub_frame():
+    """`agent.py` derives substeps as `tick_ms / dt / subframes` and never rounds,
+    so a `dt` that does not divide both silently drops biological time."""
+    assert TICK_MS % DEFAULT_DT_MS == 0
+    assert FRAME_MS % DEFAULT_DT_MS == 0
+
+
+def test_the_noise_std_holds_the_membrane_noise_fixed_across_dt():
+    """The bug that made a coarser step look expensive: the engine draws one sample
+    per step, so a fixed std is a louder membrane at every larger `dt`, and the
+    connectome-free null rose 1.041 -> 2.192 -> 2.848 Hz and ate the band."""
+
+    def membrane_sigma(dt: float) -> float:
+        av = math.exp(-dt / 20.0)
+        return noise_std_for_dt(dt) * math.sqrt((1.0 - av) / (1.0 + av))
+
+    assert noise_std_for_dt(1.0) == DEFAULT_SPONTANEOUS_NOISE_STD
+    baseline = membrane_sigma(1.0)
+    for dt in (0.5, 2.0, 3.0, 5.0):
+        assert membrane_sigma(dt) == pytest.approx(baseline, rel=1e-9)
+        # Coarser steps need *less* per-step current, not more.
+        assert (noise_std_for_dt(dt) < DEFAULT_SPONTANEOUS_NOISE_STD) == (dt > 1.0)
 
 
 def _feedforward_net(n: int):

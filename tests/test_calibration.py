@@ -90,16 +90,23 @@ def test_a_missing_artifact_is_none_not_an_exception(tmp_path):
     assert load_calibration(tmp_path / "nothing.json") is None
     assert UNCALIBRATED.gain == 1.0
     assert not UNCALIBRATED.calibrated
-    assert UNCALIBRATED.engine_kwargs() == {}
+    assert UNCALIBRATED.engine_kwargs() == {"dt_ms": 1.0}
     assert "UNCALIBRATED" in UNCALIBRATED.describe()
 
 
 def test_engine_kwargs_and_encode_params_carry_the_values_through():
     c = _calibration(_connectome())
-    assert c.engine_kwargs() == {"spontaneous_noise_std": 0.5, "b": 2.0, "tau_w": 150.0}
+    assert c.engine_kwargs() == {
+        "dt_ms": 1.0,
+        "spontaneous_noise_std": 0.5,
+        "b": 2.0,
+        "tau_w": 150.0,
+    }
     assert c.encode_params().i_max == 24.0
     # Unset fields stay unset rather than overriding the engine's own defaults.
-    assert Calibration(gain=1.0, b=3.0).engine_kwargs() == {"b": 3.0}
+    # dt_ms is always present: the engine is built from the artifact, so a dt
+    # mismatch is structurally impossible rather than merely loud.
+    assert Calibration(gain=1.0, b=3.0).engine_kwargs() == {"dt_ms": 1.0, "b": 3.0}
     assert "gain 2.0334" in c.describe()
     assert "1.0-5.0 Hz" in c.describe()
 
@@ -135,6 +142,7 @@ def test_the_live_path_builds_its_engine_and_encoder_from_the_calibration(tmp_pa
 
     assert seen["kwargs"] == {
         "seed": 0,
+        "dt_ms": 1.0,
         "spontaneous_noise_std": 0.5,
         "b": 2.0,
         "tau_w": 150.0,
@@ -165,7 +173,7 @@ def test_a_run_without_an_artifact_says_so_and_runs_raw(tmp_path, monkeypatch, c
     err = capsys.readouterr().err
     assert "UNCALIBRATED: running at gain 1.0, the brain will be silent" in err
     assert "calibration     UNCALIBRATED" in err
-    assert seen["kwargs"] == {"seed": 0}
+    assert seen["kwargs"] == {"seed": 0, "dt_ms": 1.0}
     np.testing.assert_array_equal(seen["W"].data, connectome.W.data)
 
 

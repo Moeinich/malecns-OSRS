@@ -81,6 +81,13 @@ class Calibration:
     """One accepted tuning, and everything needed to reproduce or refute it."""
 
     gain: float
+    #: The LIF step the search ran at. **Not optional and not a tuning knob**: it
+    #: sets `av`/`ag`/`aw`, `refractory_steps` and `delay_slots`, so a gain
+    #: measured at one `dt` is meaningless at another. It reaches the engine
+    #: through `engine_kwargs`, which is what makes a mismatch impossible rather
+    #: than merely loud — an artifact written before this field decodes to the
+    #: 1.0 it was measured at, not to today's default.
+    dt_ms: float = 1.0
     spontaneous_noise_std: float | None = None
     i_max: float | None = None
     #: Incoming-weight normalisation: `none`, `full` or `capped`. Not baked into
@@ -134,6 +141,7 @@ class Calibration:
     def engine_kwargs(self) -> dict[str, float]:
         """The `LIFEngine` arguments this calibration pins. Unset fields stay unset."""
         pairs = (
+            ("dt_ms", self.dt_ms),
             ("spontaneous_noise_std", self.spontaneous_noise_std),
             ("b", self.b),
             ("tau_w", self.tau_w),
@@ -155,8 +163,8 @@ class Calibration:
         rate = f"{self.rates.mean_hz:.2f} Hz" if self.rates is not None else "n/a"
         tonic = "none" if self.tonic_fraction is None else f"{self.tonic_fraction:.3g}"
         return (
-            f"gain {self.gain:.6g}  band {lo}-{hi} Hz  measured {rate}  "
-            f"normalize {self.normalization}  tonic {tonic}"
+            f"gain {self.gain:.6g}  dt {self.dt_ms:g} ms  band {lo}-{hi} Hz  "
+            f"measured {rate}  normalize {self.normalization}  tonic {tonic}"
         )
 
     def save(self, path: Path | str = DEFAULT_CALIBRATION_PATH) -> Path:
@@ -209,6 +217,7 @@ def _encode(c: Calibration) -> dict[str, Any]:
     return {
         "format": FORMAT_VERSION,
         "gain": c.gain,
+        "dt_ms": c.dt_ms,
         "spontaneous_noise_std": c.spontaneous_noise_std,
         "i_max": c.i_max,
         "normalization": c.normalization,
@@ -232,6 +241,7 @@ def _decode(d: dict[str, Any]) -> Calibration:
     acceptance, rates, fp = d.get("acceptance"), d.get("rates"), d.get("connectome")
     return Calibration(
         gain=float(d["gain"]),
+        dt_ms=float(d.get("dt_ms", 1.0)),
         spontaneous_noise_std=d.get("spontaneous_noise_std"),
         i_max=d.get("i_max"),
         normalization=d.get("normalization", "none"),

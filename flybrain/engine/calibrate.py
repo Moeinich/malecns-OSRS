@@ -30,11 +30,11 @@ Measured on the real build, that is exactly what happens: the mean rate goes fro
 0.10 Hz at gain 2.03285 to 5.23 Hz at 2.03399 — a 0.06% change in gain — and no scalar
 multiplier holds the band, the upper bracket staying bimodal with 76.6% of cells silent.
 Worse, the quiet side is *metastable*, not stable: the network reads near-zero over
-2,000 steps and tens of Hz over 8,000, because the avalanche takes seconds of simulated
-time to ignite. So `measure_steps` is part of the claim, not a tuning knob — a short
+2 s and tens of Hz over 8 s, because the avalanche takes seconds of simulated time to
+ignite. So the measurement window is part of the claim, not a tuning knob — a short
 window will call a supercritical network silent. The default is therefore tied to the
 timescale on which ignition was actually observed (8 s of simulated time), not to a
-round number: 2,000 steps is shorter than the phenomenon being measured.
+round number, and it is held in *ms* so that `dt` cannot shorten it silently.
 
 These figures are from the corrected, correctly-oriented connectome. An earlier run on a
 transposed matrix put the cliff at gain ~2.9131; fixing the orientation moved it to
@@ -45,6 +45,7 @@ LIF model, not of that bug.
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -111,7 +112,61 @@ BIMODALITY_UNIFORM = 5.0 / 9.0
 #: 4.0 is the first value that gives every neuron a floor, and it lands on
 #: ornata's ~1.2 Hz. Against an encoder peak of 6.0 (a 6 mV displacement) the
 #: noise contributes 0.63 mV, so the sensory signal is still 10x the jitter.
+#:
+#: **This is the value at dt = 1 ms**, and it does not transfer: see
+#: `noise_std_for_dt`. The engine draws one sample per step, so a fixed std is a
+#: different membrane process at every dt.
 DEFAULT_SPONTANEOUS_NOISE_STD = 4.0
+
+#: The `dt` the search and the live brain run at, in ms.
+#:
+#: It was 1.0, and at 1.0 the tick cannot be simulated. The per-step cost splits
+#: into a dense O(N) part (voltage, conductance and adaptation decay, and the
+#: noise draw over all 184,110 neurons) and an event-driven part (edges touched),
+#: and only the dense part scales with the step count. Measured on the full build
+#: at the calibrated operating point, per 600 ms tick:
+#:
+#:     dt  substeps  dense floor  total    mean Hz  x null
+#:     1   600       433.5 ms     590.2 ms   2.15    2.06
+#:     2   300       216.4 ms     352.8 ms   2.20    2.36
+#:     3   200       144.5 ms     274.6 ms   2.30    2.69
+#:
+#: dt = 1 cannot fit the 360 ms deadline at any gain: its *dense floor alone*,
+#: measured with a zero weight matrix and nothing firing, is 433 ms. Neither the
+#: gain nor the band nor the sub-frame count is a lever on that — sub-frames in
+#: particular are not a lever on anything here, since the substeps per tick are
+#: `tick_ms / dt` however they are grouped.
+#:
+#: 2, not 3, because of what the derived constants do. `refractory_steps` is
+#: `round(2.0 / dt)`: exact at dt = 2, and at dt = 3 it rounds to one step and
+#: stretches the refractory period to 3 ms. `delay_slots` is `round(1.8 / dt)`:
+#: 2 ms at dt = 2, 3 ms at dt = 3. dt = 3 buys 78 ms by distorting the two
+#: constants that set the network's timescales; dt = 2 fits without that.
+DEFAULT_DT_MS = 2.0
+
+
+def noise_std_for_dt(
+    dt_ms: float, tau_m: float = 20.0, std_at_1ms: float = DEFAULT_SPONTANEOUS_NOISE_STD
+) -> float:
+    """`spontaneous_noise_std` that holds the *membrane* noise fixed across `dt`.
+
+    The engine draws one sample per step and passes it through the same
+    `1 - exp(-dt/tau_m)` the drive gets, so a constant std is a coarser-and-louder
+    process as `dt` grows: the standing deviation on `v` is
+    `std * sqrt((1-av)/(1+av))`, which runs 0.158 -> 0.224 -> 0.274 of the current
+    for dt = 1, 2, 3. Left alone that is not a smaller time step, it is a noisier
+    neuron, and it shows up exactly where it does the most damage — the
+    connectome-free null, which rose 1.041 -> 2.192 -> 2.848 Hz and ate the band
+    the accepted point has to clear. Rescaled, the null holds at 1.04 -> 0.93 ->
+    0.86 Hz and `dt` costs only time.
+    """
+
+    def sigma(dt: float) -> float:
+        av = math.exp(-dt / tau_m)
+        return math.sqrt((1.0 - av) / (1.0 + av))
+
+    return std_at_1ms * sigma(1.0) / sigma(dt_ms)
+
 
 #: `LIFEngine`'s own resting and threshold potentials. Repeated here so a tonic
 #: can be expressed as a fraction of the distance between them rather than as a
@@ -148,24 +203,33 @@ DEFAULT_NORMALIZATION = "capped"
 
 Drive = Callable[[int], np.ndarray]
 
-#: One game tick of simulated time at dt = 1 ms, matching `bridge/config.ts`.
+#: One game tick of simulated time, matching `bridge/config.ts`.
 TICK_MS = 600
 #: Sub-frames per tick, as `flybrain/loop/agent.py` renders them.
 SUBFRAMES_PER_TICK = 4
-#: One encoder sub-frame. The drive is held this long because the membrane
+#: One encoder sub-frame, in ms. The drive is held this long because the membrane
 #: charges over tau_m; a current resampled every step charges nothing.
-FRAME_STEPS = TICK_MS // SUBFRAMES_PER_TICK
+FRAME_MS = TICK_MS // SUBFRAMES_PER_TICK
 
-#: The measurement window, in steps of dt = 1 ms.
+#: The measurement window, in ms of simulated time.
 #:
 #: This is a claim, not a knob. The quiet branch of this network is metastable:
-#: it reads 0.072 Hz over 2,000 steps and 27.3 Hz over 8,000, because the
-#: avalanche needs seconds of simulated time to ignite. A window shorter than
-#: the ignition timescale calls a supercritical network calm, so the default is
-#: the window at which ignition was actually observed — 8 s — and the cost of
-#: the longer run is the price of the measurement being true.
-DEFAULT_MEASURE_STEPS = 8000
-DEFAULT_WARMUP_STEPS = 500
+#: it reads 0.072 Hz over 2 s and 27.3 Hz over 8 s, because the avalanche needs
+#: seconds of simulated time to ignite. A window shorter than the ignition
+#: timescale calls a supercritical network calm, so the default is the window at
+#: which ignition was actually observed — 8 s — and the cost of the longer run is
+#: the price of the measurement being true.
+#:
+#: In *ms*, not steps, for the same reason `dt` is now calibrated: a window
+#: pinned at 8,000 steps is 8 s at dt = 1 and 16 s at dt = 2, so the constant
+#: would quietly stop meaning what its docstring says the moment dt moved.
+DEFAULT_MEASURE_MS = 8000
+DEFAULT_WARMUP_MS = 500
+
+
+def steps_for(ms: float, dt_ms: float) -> int:
+    """`ms` of simulated time as a step count at `dt_ms`. Never zero."""
+    return max(1, round(ms / dt_ms))
 
 
 @dataclass(frozen=True)
@@ -326,15 +390,18 @@ def sensory_drive(
     *,
     amplitude: float,
     active_fraction: float = 0.01,
-    frame_steps: int = FRAME_STEPS,
+    dt_ms: float = DEFAULT_DT_MS,
+    frame_steps: int | None = None,
     seed: int = 0,
 ) -> Drive:
     """A sparse current into `indices` — the stand-in for real encoder output.
 
     The pattern is held for `frame_steps` because the membrane charges over
     `tau_m`: a current resampled every step charges nothing and the network stays
-    silent regardless of gain. The default is one of the encoder's four sub-frames
-    per 600 ms tick, so this is also what the real input looks like.
+    silent regardless of gain. `frame_steps` defaults to one of the encoder's four
+    sub-frames per 600 ms tick *at `dt_ms`*, so this is also what the real input
+    looks like — and it follows `dt` rather than pinning the frame to a step count
+    that would mean a different length of held current at every `dt`.
 
     `amplitude` has no default on purpose. It used to be a bare 20.0 while the
     encoder capped at 6.0, so the search tuned a network the live brain never ran;
@@ -349,6 +416,8 @@ def sensory_drive(
     indices = np.asarray(indices, dtype=np.int64)
     if indices.size == 0:
         raise ValueError("sensory_drive needs at least one target index")
+    if frame_steps is None:
+        frame_steps = steps_for(FRAME_MS, dt_ms)
     k = max(1, round(indices.size * active_fraction))
     frames: dict[int, np.ndarray] = {}
 
@@ -412,14 +481,16 @@ def measure_gain(
     gain: float,
     drive: Drive,
     *,
-    dt_ms: float = 1.0,
-    warmup_steps: int = DEFAULT_WARMUP_STEPS,
-    measure_steps: int = DEFAULT_MEASURE_STEPS,
+    dt_ms: float = DEFAULT_DT_MS,
+    warmup_steps: int | None = None,
+    measure_steps: int | None = None,
     v_thresh: np.ndarray | None = None,
     noise_std: float = DEFAULT_SPONTANEOUS_NOISE_STD,
     engine_kwargs: dict | None = None,
 ) -> Measurement:
     """Run the engine at `gain` and report what the network actually does."""
+    warmup_steps = steps_for(DEFAULT_WARMUP_MS, dt_ms) if warmup_steps is None else warmup_steps
+    measure_steps = steps_for(DEFAULT_MEASURE_MS, dt_ms) if measure_steps is None else measure_steps
     scaled = sp.csc_matrix(
         (W.data.astype(np.float32) * np.float32(gain), W.indices, W.indptr), shape=W.shape
     )
@@ -459,9 +530,9 @@ def calibrate_gain(
     drive_amplitude: float | None = None,
     gain_range: tuple[float, float] = (1e-3, 10.0),
     max_iter: int = 14,
-    dt_ms: float = 1.0,
-    warmup_steps: int = DEFAULT_WARMUP_STEPS,
-    measure_steps: int = DEFAULT_MEASURE_STEPS,
+    dt_ms: float = DEFAULT_DT_MS,
+    warmup_steps: int | None = None,
+    measure_steps: int | None = None,
     trim_thresholds: bool = False,
     trim_rounds: int = 3,
     noise_std: float = DEFAULT_SPONTANEOUS_NOISE_STD,
@@ -650,12 +721,14 @@ def _population_rates(
     thresholds: np.ndarray,
     named: dict[str, np.ndarray],
     *,
-    dt_ms: float = 1.0,
-    warmup_steps: int = DEFAULT_WARMUP_STEPS,
-    measure_steps: int = DEFAULT_MEASURE_STEPS,
+    dt_ms: float = DEFAULT_DT_MS,
+    warmup_steps: int | None = None,
+    measure_steps: int | None = None,
     noise_std: float = DEFAULT_SPONTANEOUS_NOISE_STD,
     engine_kwargs: dict | None = None,
 ) -> dict[str, float]:
+    warmup_steps = steps_for(DEFAULT_WARMUP_MS, dt_ms) if warmup_steps is None else warmup_steps
+    measure_steps = steps_for(DEFAULT_MEASURE_MS, dt_ms) if measure_steps is None else measure_steps
     scaled = sp.csc_matrix(
         (W.data.astype(np.float32) * np.float32(gain), W.indices, W.indptr), shape=W.shape
     )
@@ -732,11 +805,22 @@ def main(argv: list[str] | None = None) -> int:
     # 10 brackets it with room on both sides.
     p.add_argument("--gain-range", type=float, nargs=2, default=[1e-3, 10.0])
     p.add_argument("--max-iter", type=int, default=14)
-    p.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
-    p.add_argument("--measure-steps", type=int, default=DEFAULT_MEASURE_STEPS)
+    p.add_argument(
+        "--dt",
+        type=float,
+        default=DEFAULT_DT_MS,
+        help="LIF step in ms; the calibration is only valid at the dt it was measured at",
+    )
+    p.add_argument("--warmup-ms", type=float, default=DEFAULT_WARMUP_MS)
+    p.add_argument("--measure-ms", type=float, default=DEFAULT_MEASURE_MS)
     p.add_argument("--amplitude", type=float, default=EncodeParams().i_max)
     p.add_argument("--active-fraction", type=float, default=0.01)
-    p.add_argument("--noise-std", type=float, default=DEFAULT_SPONTANEOUS_NOISE_STD)
+    p.add_argument(
+        "--noise-std",
+        type=float,
+        default=None,
+        help="default holds the membrane noise fixed across dt; see noise_std_for_dt",
+    )
     p.add_argument("--normalize", choices=NORMALIZATION_MODES, default=DEFAULT_NORMALIZATION)
     p.add_argument("--incoming-cap", type=float, default=DEFAULT_INCOMING_CAP)
     p.add_argument("--tonic-fraction", type=float, default=DEFAULT_TONIC_FRACTION)
@@ -756,6 +840,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = p.parse_args(argv)
 
+    noise_std = noise_std_for_dt(args.dt) if args.noise_std is None else args.noise_std
+    warmup_steps = steps_for(args.warmup_ms, args.dt)
+    measure_steps = steps_for(args.measure_ms, args.dt)
+
     connectome = load(args.path)
     present = [connectome.populations[n] for n in LUMINANCE_TYPES if n in connectome.populations]
     drive = sensory_drive(
@@ -763,6 +851,7 @@ def main(argv: list[str] | None = None) -> int:
         np.concatenate(present),
         amplitude=args.amplitude,
         active_fraction=args.active_fraction,
+        dt_ms=args.dt,
     )
     acceptance = Acceptance(target_hz=tuple(args.target), null_margin=args.null_margin)
     result = calibrate_gain(
@@ -772,9 +861,10 @@ def main(argv: list[str] | None = None) -> int:
         populations=connectome.populations,
         gain_range=tuple(args.gain_range),
         max_iter=args.max_iter,
-        warmup_steps=args.warmup_steps,
-        measure_steps=args.measure_steps,
-        noise_std=args.noise_std,
+        dt_ms=args.dt,
+        warmup_steps=warmup_steps,
+        measure_steps=measure_steps,
+        noise_std=noise_std,
         normalize=args.normalize,
         incoming_cap=args.incoming_cap,
         tonic_fraction=args.tonic_fraction,
@@ -783,21 +873,26 @@ def main(argv: list[str] | None = None) -> int:
     print(f"connectome       {args.path}  N={connectome.n}  nnz={connectome.W.nnz}")
     print(f"normalize        {args.normalize}  cap {args.incoming_cap:g}")
     print(
+        f"dt               {args.dt:g} ms  -> {steps_for(TICK_MS, args.dt)} substeps per "
+        f"{TICK_MS} ms tick, {measure_steps} step window"
+    )
+    print(
         f"tonic            {args.tonic_fraction:g} of threshold distance "
-        f"= {tonic_current(args.tonic_fraction):.3f}  noise_std {args.noise_std:g}"
+        f"= {tonic_current(args.tonic_fraction):.3f}  noise_std {noise_std:g}"
     )
     print(format_report(result))
     if args.save and result.success:
         path = Calibration(
             gain=result.gain,
-            spontaneous_noise_std=args.noise_std,
+            dt_ms=args.dt,
+            spontaneous_noise_std=noise_std,
             i_max=args.amplitude,
             normalization=args.normalize,
             incoming_cap=args.incoming_cap,
             tonic_fraction=args.tonic_fraction or None,
             acceptance=acceptance,
             rates=result.measurement.rates,
-            measure_steps=args.measure_steps,
+            measure_steps=measure_steps,
             drive=(
                 f"sensory_drive over {'/'.join(LUMINANCE_TYPES)}, amplitude {args.amplitude:g}, "
                 f"active_fraction {args.active_fraction:g}, tonic {args.tonic_fraction:g}"

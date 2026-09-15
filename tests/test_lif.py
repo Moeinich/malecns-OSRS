@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 import numpy as np
+import pytest
 import scipy.sparse as sp
 
 from flybrain.engine.lif import LIFEngine
@@ -24,16 +25,23 @@ def _spike_steps(fired: list[np.ndarray], neuron: int) -> list[int]:
     return [k for k, f in enumerate(fired) if neuron in f]
 
 
-def test_suprathreshold_current_fires_and_rate_rises_with_current():
+@pytest.mark.parametrize("dt_ms", [1.0, 2.0, 3.0])
+def test_suprathreshold_current_fires_and_rate_rises_with_current(dt_ms: float):
+    """f-I is a claim about the neuron, so it has to survive `dt` moving.
+
+    The window is 400 ms of simulated time, not 400 steps: the adapted asymptote
+    is set by `b * tau_w`, which `dt` does not touch, but a window pinned in steps
+    would measure a different stretch of the adaptation transient at every `dt`.
+    """
     rates = []
     for amplitude in (16.0, 20.0, 40.0):
-        eng = _engine(1)
+        eng = _engine(1, dt_ms=dt_ms)
         cur = np.full(1, amplitude, dtype=np.float32)
-        _run(eng, cur, 400)
+        _run(eng, cur, round(400.0 / dt_ms))
         rate = float(eng.get_firing_rates()[0])
-        assert rate > 0.0, f"no spikes at I={amplitude}"
+        assert rate > 0.0, f"no spikes at I={amplitude}, dt={dt_ms}"
         rates.append(rate)
-    assert rates[0] < rates[1] < rates[2], rates
+    assert rates[0] < rates[1] < rates[2], (dt_ms, rates)
 
 
 def test_refractory_period_is_respected():
