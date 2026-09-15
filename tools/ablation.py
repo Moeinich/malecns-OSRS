@@ -63,7 +63,7 @@ DEFAULT_CONDITIONS = (
 )
 
 BASELINE = "real"
-DEFAULT_PRIMARY = "xp_per_hr"
+DEFAULT_PRIMARY = "moving_fraction"
 
 SCALAR_METRICS = (
     "kills_per_hr",
@@ -72,16 +72,23 @@ SCALAR_METRICS = (
     "mean_hp_fraction",
     "distance",
     "tortuosity",
+    "moving_fraction",
     "time_to_first_attack_s",
     "mean_rate_hz",
+    "mean_ms_per_tick",
 )
 
 #: Recorded in every report rather than papered over. Both are live as of writing.
 CAVEATS = (
     (
-        "The brain overruns its tick on some ticks (84-111 ms of work against a 90 ms deadline "
-        "at NODE_TICKRATE=150) and the encoder drive goes stale on those. It applies equally to "
-        "every condition so it cannot bias the contrast; `overrun_fraction` is per condition."
+        "The brain overruns its tick (84-111 ms of work against a 90 ms deadline at "
+        "NODE_TICKRATE=150) and the encoder drive goes stale on the ticks it does. Overrun is "
+        "NOT equal across conditions: the cost of a step is edges touched = N x firing rate x "
+        "degree, so a hotter condition overruns more. Measured overrun_fraction: real 0.258, "
+        "lesion:DNa02 0.451, lesion:optic 0.0005, ablate-network 0.001, shuffle 1.000. Staleness "
+        "is therefore a LIVE CONFOUND on any contrast between conditions of unequal firing rate "
+        "— shuffle fires 64% hotter than real and missed every deadline. `overrun_fraction` and "
+        "`mean_ms_per_tick` are per condition."
     ),
     (
         "The decoded drive sits near 0.10 with a steering differential of about +/-0.1 rad, so "
@@ -104,6 +111,11 @@ SHUFFLE_BETTER = (
     "rewire with the same degrees and signs played better."
 )
 SHUFFLE_ABSENT = "shuffle was not run: no verdict on the wiring."
+SHUFFLE_DEGENERATE = (
+    "NO VERDICT: the primary metric {metric} had no variance across the real and shuffle "
+    "episodes — every episode scored the same value, so no effect could be significant and "
+    "nothing can be concluded about the wiring."
+)
 
 
 class StackDown(RuntimeError):
@@ -169,6 +181,7 @@ class TickRecord:
     deaths: int
     mean_rate_hz: float
     overrun: bool
+    ms_total: float
 
 
 @dataclass(frozen=True)
@@ -179,6 +192,9 @@ class Episode:
     wall_s: float
     records: tuple[TickRecord, ...]
     dropped_game_ticks: int = 0
+    #: The tick length the sidecar measured, when it measured one. `None` is
+    #: "never reported", not "matches the configured value".
+    observed_tick_ms: float | None = None
 
 
 class Recorder:
@@ -190,11 +206,14 @@ class Recorder:
 
     def __init__(self) -> None:
         self.records: list[TickRecord] = []
+        self.observed_tick_ms: float | None = None
         self._engaged: set[int] = set()
         self._life_id: int | None = None
 
     def observe(self, update: StateUpdate, report: Any) -> TickRecord | None:
         """A tick with no player (logged out, loading) is driven but not scored."""
+        if update.observed_tick_ms is not None:
+            self.observed_tick_ms = float(update.observed_tick_ms)
         player = update.state.player
         if player is None:
             return None
@@ -210,6 +229,7 @@ class Recorder:
             deaths=self._deaths(player),
             mean_rate_hz=float(report.mean_rate_hz),
             overrun=bool(report.overrun),
+            ms_total=float(report.ms_total),
         )
         self.records.append(record)
         return record
@@ -269,6 +289,7 @@ def record_episode(
         wall_s=time.monotonic() - started,
         records=tuple(recorder.records),
         dropped_game_ticks=dropped(),
+        observed_tick_ms=recorder.observed_tick_ms,
     )
 
 
@@ -292,6 +313,7 @@ def metrics(episode: Episode) -> dict[str, float]:
         "mean_hp_fraction": _mean([x.hp / x.max_hp for x in r if x.max_hp > 0]),
         "mean_rate_hz": _mean([x.mean_rate_hz for x in r]),
         "overrun_fraction": _mean([float(x.overrun) for x in r]),
+        "mean_ms_per_tick": _mean([x.ms_total for x in r]),
         "time_to_first_attack_s": _time_to_first_attack(episode),
     }
     out.update(_path(r))
@@ -467,8 +489,34 @@ def _column(runs: Sequence[dict[str, float]], metric: str) -> list[float]:
 # ------------------------------------------------------------------ verdicts
 
 
-def shuffle_verdict(effects_by_condition: dict[str, dict[str, Effect]], primary: str) -> str:
+def degenerate(per_condition: dict[str, list[dict[str, float]]], primary: str) -> bool:
+    """True when the primary metric cannot carry a verdict at all.
+
+    A metric that is the same number in every episode of `real` and `shuffle`
+    makes every contrast non-significant by construction, which reads exactly
+    like a clean "no difference" and is not one.
+    """
+    values = [
+        v
+        for condition in (BASELINE, "shuffle")
+        for v in _column(per_condition.get(condition, []), primary)
+        if math.isfinite(v)
+    ]
+    return len(values) < 2 or min(values) == max(values)
+
+
+def _degenerate(primary: str) -> str:
+    return SHUFFLE_DEGENERATE.format(metric=primary)
+
+
+def shuffle_verdict(
+    effects_by_condition: dict[str, dict[str, Effect]],
+    primary: str,
+    per_condition: dict[str, list[dict[str, float]]],
+) -> str:
     """The sentence this whole harness exists to be able to print, either way."""
+    if degenerate(per_condition, primary):
+        return _degenerate(primary)
     effect = effects_by_condition.get("shuffle", {}).get(primary)
     if effect is None or not math.isfinite(effect.delta):
         return SHUFFLE_ABSENT
@@ -478,7 +526,9 @@ def shuffle_verdict(effects_by_condition: dict[str, dict[str, Effect]], primary:
 
 
 def expectations(
-    effects_by_condition: dict[str, dict[str, Effect]], primary: str
+    effects_by_condition: dict[str, dict[str, Effect]],
+    primary: str,
+    per_condition: dict[str, list[dict[str, float]]],
 ) -> list[tuple[str, str, str]]:
     """Each stated expectation and whether this run met it.
 
@@ -486,15 +536,19 @@ def expectations(
     embarrassing: every line can read FAILED and the run is still a result.
     """
     out: list[tuple[str, str, str]] = []
+    flat = degenerate(per_condition, primary)
+
+    def on_primary(effect: Effect) -> tuple[str, str]:
+        if flat:
+            return ("NO VERDICT", f"{primary} had no variance across real and shuffle")
+        return (_held(_dropped(effect)), _fmt_effect(effect))
 
     def get(condition: str, metric: str) -> Effect | None:
         return effects_by_condition.get(condition, {}).get(metric)
 
     ablate = get("ablate-network", primary)
     if ablate is not None:
-        out.append(
-            ("ablate-network collapses to chance", _held(_dropped(ablate)), _fmt_effect(ablate))
-        )
+        out.append(("ablate-network collapses to chance", *on_primary(ablate)))
 
     flee = get("lesion:DNp01", "action:flee")
     p_attack = get("lesion:DNp01", "action:attack_fovea")
@@ -530,7 +584,7 @@ def expectations(
 
     shuffle = get("shuffle", primary)
     if shuffle is not None:
-        out.append(("shuffle degrades vs real", _held(_dropped(shuffle)), _fmt_effect(shuffle)))
+        out.append(("shuffle degrades vs real", *on_primary(shuffle)))
     return out
 
 
@@ -552,6 +606,8 @@ def _fmt_effect(e: Effect) -> str:
 
 @dataclass(frozen=True)
 class RunMeta:
+    #: The tick the rates were scored against: the measured one where the stack
+    #: measured it, else the one it was configured with.
     tick_ms: int
     ticks_per_episode: int
     episodes: int
@@ -562,6 +618,21 @@ class RunMeta:
     calibration: str
     calibration_params: dict[str, Any]
     started: str
+    configured_tick_ms: int | None = None
+    observed_tick_ms: float | None = None
+
+
+def _tick_mismatch(meta: RunMeta) -> list[str]:
+    """Said out loud when the measured tick and the configured one disagree."""
+    observed = meta.observed_tick_ms
+    if observed is None or meta.configured_tick_ms in (None, round(observed)):
+        return []
+    return [
+        (
+            f"TICK MISMATCH      configured {meta.configured_tick_ms} ms, observed "
+            f"{observed:.1f} ms — the rates above are scored against the observed value"
+        )
+    ]
 
 
 def report(
@@ -581,6 +652,7 @@ def report(
             f"NODE_TICKRATE      {meta.tick_ms} ms per game tick (a confound: it sets how "
             f"much biological time the brain gets per decision)"
         ),
+        *_tick_mismatch(meta),
         f"calibration        {meta.calibration}",
         (
             f"mode               {'dry-run (no commands sent)' if meta.dry_run else 'live'}, "
@@ -609,10 +681,10 @@ def report(
             lines.append(f"  {flag} {metric.ljust(24)} {_fmt_effect(e)}")
 
     lines += ["", "-- expectations " + "-" * 62]
-    for name, held, detail in expectations(effects_by_condition, meta.primary):
+    for name, held, detail in expectations(effects_by_condition, meta.primary, per_condition):
         lines.append(f"  {held:<6} {name}  ({detail})")
 
-    verdict = shuffle_verdict(effects_by_condition, meta.primary)
+    verdict = shuffle_verdict(effects_by_condition, meta.primary, per_condition)
     lines += [
         "",
         "-- the verdict that matters " + "-" * 50,
@@ -641,9 +713,11 @@ def to_json(
             },
             "expectations": [
                 {"expectation": name, "verdict": held, "detail": detail}
-                for name, held, detail in expectations(effects_by_condition, meta.primary)
+                for name, held, detail in expectations(
+                    effects_by_condition, meta.primary, per_condition
+                )
             ],
-            "shuffle_verdict": shuffle_verdict(effects_by_condition, meta.primary),
+            "shuffle_verdict": shuffle_verdict(effects_by_condition, meta.primary, per_condition),
         }
     )
 
@@ -849,7 +923,7 @@ def main(argv: list[str] | None = None) -> int:
     for condition in args.conditions:
         print(f"condition {condition}", file=sys.stderr)
         runs = run_condition(stack, condition, args.episodes, args.ticks, args.seed)
-        meta = replace(meta, tick_ms=runs[0].tick_ms)
+        meta = replace(meta, **tick_fields(runs))
         per_condition[condition] = [metrics(e) for e in runs]
         if out_path:
             write_json(out_path, partial_json(per_condition, meta))
@@ -861,6 +935,22 @@ def main(argv: list[str] | None = None) -> int:
         write_json(out_path, to_json(per_condition, computed, meta))
         print(f"wrote {out_path}", file=sys.stderr)
     return 0
+
+
+def tick_fields(episodes: Sequence[Episode]) -> dict[str, Any]:
+    """The tick the scores are read against: measured where the stack measured it.
+
+    Recorded alongside the configured value rather than in place of it, so a
+    disagreement is reported instead of silently resolved.
+    """
+    measured = [e.observed_tick_ms for e in episodes if e.observed_tick_ms is not None]
+    observed = _mean(measured) if measured else None
+    configured = episodes[0].tick_ms
+    return {
+        "tick_ms": round(observed) if observed is not None else configured,
+        "configured_tick_ms": configured,
+        "observed_tick_ms": observed,
+    }
 
 
 def calibration_params(calibration: Calibration) -> dict[str, Any]:

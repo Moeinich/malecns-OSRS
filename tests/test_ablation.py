@@ -17,6 +17,7 @@ from flybrain.loop.types import Npc, Player, StateUpdate, WorldState
 from tools.ablation import (
     SHUFFLE_ABSENT,
     SHUFFLE_BETTER,
+    SHUFFLE_DEGENERATE,
     SHUFFLE_DEGRADED,
     SHUFFLE_MATCHED,
     Episode,
@@ -34,6 +35,7 @@ from tools.ablation import (
     record_episode,
     report,
     shuffle_verdict,
+    tick_fields,
     to_json,
     validate_conditions,
     write_json,
@@ -80,14 +82,16 @@ def npc(index: int, hp: int | None = 5) -> Npc:
     )
 
 
-def update(tick: int, p: Player | None, npcs=(), xp: int = 0) -> StateUpdate:
+def update(
+    tick: int, p: Player | None, npcs=(), xp: int = 0, observed_tick_ms: float | None = None
+) -> StateUpdate:
     return StateUpdate(
         revision=tick,
         tick=tick,
         dropped_since_last=0,
         deadline_ms=360,
         tick_ms=600,
-        observed_tick_ms=None,
+        observed_tick_ms=observed_tick_ms,
         state=WorldState(
             tick=tick,
             in_game=p is not None,
@@ -109,10 +113,13 @@ class FakeAction:
 
 
 class FakeReport:
-    def __init__(self, kind: str, rate: float = 1.75, overrun: bool = False) -> None:
+    def __init__(
+        self, kind: str, rate: float = 1.75, overrun: bool = False, ms_total: float = 42.0
+    ) -> None:
         self.action = FakeAction(kind)
         self.mean_rate_hz = rate
         self.overrun = overrun
+        self.ms_total = ms_total
 
 
 def tick_fn(kinds):
@@ -142,6 +149,7 @@ def record(**kw) -> TickRecord:
         "deaths": 0,
         "mean_rate_hz": 1.75,
         "overrun": False,
+        "ms_total": 42.0,
     }
     return TickRecord(**(base | kw))
 
@@ -384,9 +392,9 @@ def test_a_missing_action_key_is_a_zero_not_a_gap():
 # ------------------------------------------------------------------ verdicts
 
 
-def meta(primary: str = "xp_per_hr") -> RunMeta:
+def meta(primary: str = "xp_per_hr", **kw) -> RunMeta:
     return RunMeta(
-        tick_ms=100,
+        **{"tick_ms": 100} | kw,
         ticks_per_episode=400,
         episodes=10,
         seed=0,
@@ -410,13 +418,13 @@ def scored(shuffle_values: list[float]) -> tuple[dict, dict]:
 
 def test_a_shuffle_that_degrades_is_reported_as_the_wiring_doing_work():
     per_condition, computed = scored([3.0, 4.0, 2.0, 5.0, 1.0, 3.0, 4.0, 2.0, 5.0, 3.0])
-    assert shuffle_verdict(computed, "xp_per_hr") == SHUFFLE_DEGRADED
+    assert shuffle_verdict(computed, "xp_per_hr", per_condition) == SHUFFLE_DEGRADED
     assert SHUFFLE_DEGRADED in report(per_condition, computed, meta())
 
 
 def test_a_shuffle_that_matches_is_reported_as_the_wiring_contributing_nothing():
     per_condition, computed = scored([10.0, 11.0, 9.0, 12.0, 8.0, 10.0, 11.0, 9.0, 12.0, 10.0])
-    assert shuffle_verdict(computed, "xp_per_hr") == SHUFFLE_MATCHED
+    assert shuffle_verdict(computed, "xp_per_hr", per_condition) == SHUFFLE_MATCHED
     text = report(per_condition, computed, meta())
     assert SHUFFLE_MATCHED in text
     assert "contributes nothing" in text
@@ -425,12 +433,41 @@ def test_a_shuffle_that_matches_is_reported_as_the_wiring_contributing_nothing()
 
 def test_a_shuffle_that_wins_is_also_a_negative_result():
     per_condition, computed = scored([40.0, 41.0, 39.0, 42.0, 38.0, 40.0, 41.0, 39.0, 42.0, 40.0])
-    assert shuffle_verdict(computed, "xp_per_hr") == SHUFFLE_BETTER
+    assert shuffle_verdict(computed, "xp_per_hr", per_condition) == SHUFFLE_BETTER
     assert "contributes nothing" in report(per_condition, computed, meta())
 
 
 def test_no_shuffle_condition_gives_no_verdict():
-    assert shuffle_verdict({}, "xp_per_hr") == SHUFFLE_ABSENT
+    real = runs([10.0, 11.0, 9.0, 12.0], "xp_per_hr")
+    assert shuffle_verdict({}, "xp_per_hr", {"real": real}) == SHUFFLE_ABSENT
+
+
+def test_a_primary_metric_with_no_variance_is_a_degeneracy_not_a_match():
+    """A constant column makes every contrast non-significant by construction."""
+    per_condition = {
+        "real": runs([0.0] * 10, "xp_per_hr"),
+        "shuffle": runs([0.0] * 10, "xp_per_hr"),
+    }
+    computed = effects(per_condition, seed=0, reps=500)
+    verdict = shuffle_verdict(computed, "xp_per_hr", per_condition)
+    assert verdict == SHUFFLE_DEGENERATE.format(metric="xp_per_hr")
+    assert verdict != SHUFFLE_MATCHED
+
+    text = report(per_condition, computed, meta())
+    assert "NO VERDICT" in text
+    assert SHUFFLE_MATCHED not in text
+    assert "FAILED shuffle degrades vs real" not in text
+
+
+def test_an_all_nan_primary_metric_is_degenerate_too():
+    per_condition = {
+        "real": runs([math.nan] * 6, "xp_per_hr"),
+        "shuffle": runs([math.nan] * 6, "xp_per_hr"),
+    }
+    computed = effects(per_condition, seed=0, reps=200)
+    assert shuffle_verdict(computed, "xp_per_hr", per_condition) == SHUFFLE_DEGENERATE.format(
+        metric="xp_per_hr"
+    )
 
 
 # -------------------------------------------------------------------- report
@@ -527,3 +564,49 @@ def test_the_tickrate_is_taken_after_the_episode_not_before_the_handshake():
     )
     assert episode.tick_ms == 600, "the value read before the handshake is the stale one"
     assert dataclasses.replace(episode, tick_ms=agent.tick_ms).tick_ms == 150
+
+
+def test_the_measured_tick_is_recorded_and_a_disagreement_is_reported():
+    """The stack measured 150 ms while configured for 600; neither is dropped."""
+    e = record_episode(
+        [update(i, player(), observed_tick_ms=150.0) for i in range(3)],
+        tick_fn(["walk"] * 3),
+        condition="real",
+        seed=0,
+        ticks=3,
+        tick_ms=600,
+    )
+    assert e.observed_tick_ms == pytest.approx(150.0)
+    assert tick_fields([e]) == {
+        "tick_ms": 150,
+        "configured_tick_ms": 600,
+        "observed_tick_ms": pytest.approx(150.0),
+    }
+
+    per_condition, computed = full_run()
+    text = report(per_condition, computed, meta(**tick_fields([e])))
+    assert "NODE_TICKRATE      150 ms" in text
+    assert "configured 600 ms, observed 150.0 ms" in text
+
+
+def test_an_unmeasured_tick_falls_back_to_the_configured_one_without_a_mismatch():
+    e = record_episode(
+        [update(i, player()) for i in range(2)],
+        tick_fn(["walk"] * 2),
+        condition="real",
+        seed=0,
+        ticks=2,
+        tick_ms=600,
+    )
+    assert tick_fields([e]) == {
+        "tick_ms": 600,
+        "configured_tick_ms": 600,
+        "observed_tick_ms": None,
+    }
+    per_condition, computed = full_run()
+    assert "TICK MISMATCH" not in report(per_condition, computed, meta(**tick_fields([e])))
+
+
+def test_compute_time_is_measured_per_episode_not_only_as_an_overrun_flag():
+    m = metrics(episode([record(tick=i, ms_total=100.0 + i) for i in range(4)]))
+    assert m["mean_ms_per_tick"] == pytest.approx(101.5)
