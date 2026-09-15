@@ -7,6 +7,7 @@ bodyIds in the provenance are the ones in the release.
 
 from __future__ import annotations
 
+import itertools
 import os
 
 import numpy as np
@@ -95,16 +96,70 @@ def test_weights_are_signed_and_inhibition_exists(connectome):
     assert 0.1 < (data < 0).mean() < 0.9
 
 
-def test_sign_is_a_row_scaling_not_a_per_edge_label(built, connectome):
-    """Dale's law: every neuron's outgoing edges carry one sign."""
+def _mixed_sign_slices(indptr, data) -> int:
+    signs = np.sign(data)
+    return sum(
+        1
+        for start, end in itertools.pairwise(indptr)
+        if end > start and len(np.unique(signs[start:end])) > 1
+    )
+
+
+def test_sign_is_pure_per_column_and_impure_per_row(connectome, built):
+    """Dale's law along the engine's axis: every column is one neuron's output.
+
+    The matrix is `W[post, pre]`, so a neuron's outgoing edges are a *column*.
+    The row assertion is the half that matters: rows are the convergent input
+    to one cell, which mixes excitation and inhibition, so a future transpose
+    flips this test instead of passing either way.
+    """
+    csc = connectome.W
+    assert _mixed_sign_slices(csc.indptr, csc.data) == 0
+
     csr = loader.load_csr(built[0])
-    signs = np.sign(csr.data)
-    for start, end in zip(csr.indptr[:-1], csr.indptr[1:]):
-        if end > start:
-            assert len(np.unique(signs[start:end])) == 1
+    assert _mixed_sign_slices(csr.indptr, csr.data) > 0
+
+
+def test_descending_neurons_are_convergent_inside_this_subgraph(connectome):
+    """DNp01 (the Giant Fiber) must take in far more than it gives out here.
+
+    It is characterised by massive convergent visual input, and its own targets
+    are in the VNC — outside this CNS subgraph. High out-degree for DNp01 means
+    the columns are being read as inputs, i.e. the matrix is transposed.
+    """
+    idx = connectome.population("DNp01")
+    assert idx.size
+    csc = connectome.W
+    out_degree = np.diff(csc.indptr)[idx].mean()
+    in_degree = np.diff(csc.tocsr().indptr)[idx].mean()
+    assert in_degree > 2 * out_degree, f"DNp01 in={in_degree:.1f} out={out_degree:.1f}"
+
+
+def test_injection_layer_drives_the_network(connectome):
+    """The cells the retina writes into must drive far more than they receive.
+
+    Per type rather than in aggregate would be the stronger claim, but L1 is
+    near-isolated in this subgraph (out-degree 1.14, in-degree 1.14 at full K)
+    and carries no directional signal at all; the layer as a whole does.
+    """
+    idx = np.unique(
+        np.concatenate(
+            [
+                connectome.population(name)
+                for name in select_mod.VISUAL_INPUT_TYPES + select_mod.ON_RELAY_TYPES
+            ]
+        )
+    )
+    out_degree = np.diff(connectome.W.indptr)[idx].mean()
+    in_degree = np.diff(connectome.W.tocsr().indptr)[idx].mean()
+    assert out_degree > 5
+    assert out_degree > 1.5 * in_degree, f"injection out={out_degree:.1f} in={in_degree:.1f}"
 
 
 def test_csc_and_csr_agree(built, connectome):
+    """Storage-order agreement only. It passes just as well when both are
+    transposed, so it can never detect an orientation flip — that is what
+    `test_sign_is_pure_per_column_and_impure_per_row` is for."""
     csr = loader.load_csr(built[0])
     assert csr.shape == connectome.W.shape
     assert (csr.tocsc() - connectome.W).nnz == 0

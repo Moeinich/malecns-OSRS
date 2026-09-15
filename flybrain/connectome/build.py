@@ -3,10 +3,14 @@
     uv run python -m flybrain.connectome.build --out data/cache/connectome_v1.npz
 
 Neurotransmitter identity is a property of the *presynaptic* neuron (Dale's
-law), so signing is a row scaling of the unsigned synapse counts, never a
-per-edge label. The artifact carries the source URLs, their SHA256s, the
-selection parameters and the resolved bodyIds of every named population, so the
-claim "this is the fly" is checkable against neuprint by anyone.
+law), so signing is a scaling along the presynaptic axis of the unsigned
+synapse counts, never a per-edge label. The emitted matrix is `W[post, pre]`:
+the engine gathers column `j` when neuron `j` fires, so the presynaptic axis
+must be the column axis and every column is sign-pure.
+
+The artifact carries the source URLs, their SHA256s, the selection parameters
+and the resolved bodyIds of every named population, so the claim "this is the
+fly" is checkable against neuprint by anyone.
 """
 
 from __future__ import annotations
@@ -212,18 +216,24 @@ def build(
         "population_counts": {name: len(idx) for name, idx in populations.items()},
     }
 
-    csc = signed.tocsc()
+    # `signed` is pre-major (row = presynaptic), the orientation Dale's law is
+    # applied in. The engine needs the presynaptic axis on the columns, so the
+    # emitted matrix is its transpose, W[post, pre], in both storage orders.
+    emitted = signed.T
+    csc = emitted.tocsc()
     csc.sort_indices()
+    csr = emitted.tocsr()
+    csr.sort_indices()
     arrays = {
-        "shape": np.array(signed.shape, dtype=np.int64),
+        "shape": np.array(csc.shape, dtype=np.int64),
         "body_ids": selection.body_ids,
         "annotation_rows": selection.rows,
         "csc_data": csc.data.astype(np.float32, copy=False),
         "csc_indices": csc.indices,
         "csc_indptr": csc.indptr,
-        "csr_data": signed.data.astype(np.float32, copy=False),
-        "csr_indices": signed.indices,
-        "csr_indptr": signed.indptr,
+        "csr_data": csr.data.astype(np.float32, copy=False),
+        "csr_indices": csr.indices,
+        "csr_indptr": csr.indptr,
         "provenance": np.array(json.dumps(provenance, indent=2)),
     }
     for name, idx in populations.items():

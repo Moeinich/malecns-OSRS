@@ -5,6 +5,10 @@ because it wrote into a second copy of the graph while a different matrix was
 simulated, so this module never materializes a second one: the CSR stored for
 analysis is loaded only by an explicit call, and `engine.W is connectome.W`
 must hold for the engine built here.
+
+The stored matrix is `W[post, pre]` and is handed to the engine in exactly that
+orientation. Nothing here transposes: a flip applied on load is invisible to
+every self-consistent test and is how an orientation bug survives.
 """
 
 from __future__ import annotations
@@ -23,7 +27,8 @@ DEFAULT_PATH = Path(__file__).resolve().parents[2] / "data" / "cache" / "connect
 
 @dataclass(frozen=True)
 class Connectome:
-    #: The one weight array in the process. Mutated in place by plasticity.
+    #: The one weight array in the process, `W[post, pre]` — column `j` is
+    #: neuron `j`'s outgoing synapses. Mutated in place by plasticity.
     W: sp.csc_matrix
     body_ids: np.ndarray
     populations: dict[str, np.ndarray]
