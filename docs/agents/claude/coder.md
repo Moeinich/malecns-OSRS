@@ -28,7 +28,8 @@ VERIFIED: the command you ran and its output — or `none`
 BLOCKED:  anything you could not do, and why
 ```
 
-`VERIFIED: none` is an honest answer in this repo today: there is no test or build command yet.
-`VERIFIED:` with a command that does not exist is not. Never cite a command you did not run.
+The gate is in `AGENTS.md` (Common rules → Verification). Run it from the repo root, not an
+ad-hoc command of your own. `VERIFIED:` with a command that does not exist, or output you did not
+see, is never acceptable. Never cite a command you did not run.
 
 Maximum brevity.

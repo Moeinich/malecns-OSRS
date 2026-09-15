@@ -52,9 +52,8 @@ When a lane reports done, you verify. Every time, whatever `VERIFIED:` claims:
 2. `git log --oneline -3` — did the lane commit? Nothing prevents it; only this check catches it.
 3. Re-run the lane's `VERIFIED:` command yourself.
 
-   > **TODO(stack) — there is no gate yet.** No build, test, lint or format command exists in this
-   > repo. Until the stack lands, steps 1–2 are the whole gate. Fill in the real commands here and
-   > in `AGENTS.md` (Common rules → Verification), then delete both `TODO(stack)` markers.
-   > Do not invent a command.
+   The gate is `uv run pytest`, `uv run ruff check .` and `uv run ruff format --check .` — the
+   full list is in `AGENTS.md` (Common rules → Verification). A lane's own ad-hoc command passing
+   is not the gate passing: run the project's.
 
 4. Commit the lane by itself. **The agent never commits.**

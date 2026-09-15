@@ -27,8 +27,23 @@ in `.claude/`.
 - `docs/agents/claude/` — subagent definitions, read through `.claude/agents`
 - `docs/commands/` — slash commands, read through `.claude/commands`
 
-<!-- TODO(stack): no source code yet. When the stack lands, describe the layout here — the
-     directories, where domain code goes, and what we deliberately do not have. -->
+## Layout
+
+- `flybrain/` — the Python package, and where all domain logic goes. `engine/` is the spiking
+  simulation, `connectome/` builds and loads the network, `sensory/` and `motor/` are the two
+  halves of the sensorimotor loop, `loop/` drives a tick.
+- `bridge/` — the only TypeScript we write: a Bun sidecar owning the rs-sdk connection, speaking
+  NDJSON over a unix socket to Python.
+- `tools/` — offline scripts (data fetch, ablation harness). Not imported by `flybrain/`.
+- `vendor/rs-sdk` — pinned submodule. Never edit it; changes there are invisible to our history.
+- `data/` — gitignored. Checksums are committed, the 1 GB of connectome data is not.
+
+**What we deliberately do not have:** no PyTorch (numpy + scipy are the whole hot path, and a GPU
+would be slower at our array sizes), no async framework, no ORM, no web server beyond a static
+dashboard.
+
+**`flybrain/sensory/` must never import from `flybrain/motor/`, and `motor/decode.py` must never
+see game state.** That firewall is the project's central correctness claim, not a style rule.
 
 ## Implementation is delegated
 
@@ -63,13 +78,21 @@ agent never commits.
 
 **Verification.**
 
-> **TODO(stack) — there is no gate yet.** This repo has no build, test, lint or format command.
-> Until the stack lands, the gate is: read the diff, and nothing else.
-> Fill in: typecheck/build, the test command and how to run a single test, lint, format. Then
-> replace this block and step 4 of `docs/commands/delegate.md`, and delete both `TODO(stack)`
-> markers.
-> Do not invent a command. A lane reporting `VERIFIED:` with a command that does not exist is
-> worse than one reporting `VERIFIED: none`.
+```bash
+uv run pytest                        # all tests
+uv run pytest tests/test_lif.py::test_name -s    # one test, -s to see printed measurements
+uv run ruff check .                  # lint
+uv run ruff format --check .         # format (drop --check to apply)
+```
+
+There is no Python typechecker configured — do not cite one. TypeScript under `bridge/` is
+checked with `bunx tsc --noEmit` from the repo root once that lane lands.
+
+Run the gate from the repo root. If `flybrain` fails to import, the venv predates the package:
+`uv sync`.
+
+Do not invent a command. A lane reporting `VERIFIED:` with a command that does not exist is worse
+than one reporting `VERIFIED: none`.
 
 **Leave the area better than you found it.** Small cleanups inside your own `FILES:` — fold them
 in. Bigger ones — report them. A lane that quietly grows is worse than one that names debt.
