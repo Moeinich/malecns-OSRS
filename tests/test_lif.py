@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from itertools import pairwise
 
 import numpy as np
 import pytest
@@ -181,3 +182,61 @@ def test_zero_adaptation_leaves_the_unadapted_train_untouched():
     on = _engine(1)
     steps_on = _spike_steps(_run(on, cur, 2000), 0)
     assert len(steps_on) < len(steps_off), (len(steps_on), len(steps_off))
+
+
+def _floor_rates(n: int, steps: int, **kw) -> np.ndarray:
+    """Rates of an unconnected net held under a tonic — the membrane noise alone."""
+    eng = _engine(n, rate_window_ms=steps, spontaneous_noise_std=4.0, seed=0, **kw)
+    _run(eng, np.full(n, 13.5, dtype=np.float32), steps)
+    return eng.get_firing_rates()
+
+
+def test_the_noise_pool_leaves_the_floor_distribution_where_a_fresh_draw_puts_it():
+    """The pool is a speed change, so it has to be a no-op on the statistics.
+
+    `standard_normal` over every neuron was 0.436 ms of a 1.16 ms step at
+    N=184,110 — 131 ms of a 347 ms tick — against 0.016 ms for a rolling window
+    out of a pre-drawn pool. That trade is only free if the rate distribution
+    does not move, and the rate distribution under a tonic with no connectome at
+    all *is* the membrane noise: it is the connectome-free null every calibration
+    is accepted against. Measured on the full build, 4,000 steps at dt 2:
+
+        fresh draw   null 0.934 Hz, mean 2.197, median 1.625, silent 0.11%
+        pool         null 0.942 Hz, mean 2.214, median 1.625, silent 0.11%
+
+    so this pins the same equality at a size a test can afford.
+    """
+    fresh = _floor_rates(2_000, 4_000, noise_pool=0)
+    pooled = _floor_rates(2_000, 4_000)
+    print(
+        f"\nfloor: fresh mean {fresh.mean():.3f} Hz median {np.median(fresh):.3f} "
+        f"silent {(fresh == 0).mean():.2%} | "
+        f"pool mean {pooled.mean():.3f} Hz median {np.median(pooled):.3f} "
+        f"silent {(pooled == 0).mean():.2%}"
+    )
+    assert fresh.mean() > 0.0
+    assert abs(pooled.mean() - fresh.mean()) < 0.05 * fresh.mean()
+    assert np.median(pooled) == np.median(fresh)
+    assert abs((pooled == 0).mean() - (fresh == 0).mean()) < 0.01
+
+
+def test_the_noise_pool_hands_every_step_a_different_window():
+    """Every step reads a window no earlier step read.
+
+    The saving would be an illusion if the offset stalled or cycled short: the
+    membrane would be integrating one held sample, which is the thing this
+    deliberately is not. The windows do overlap once `N` exceeds the stride, but
+    a *shifted* window still gives each neuron an entry it has not read, which is
+    the property the noise process needs.
+    """
+    eng = _engine(64, spontaneous_noise_std=4.0, seed=0)
+    assert eng._noise_pool is not None
+    offsets = []
+    for _ in range(500):
+        offsets.append(eng._noise_offset)
+        eng.step(np.zeros(64, dtype=np.float32))
+    assert len(set(offsets)) == len(offsets)
+    assert all(a != b for a, b in pairwise(offsets))
+
+    off = _engine(64, spontaneous_noise_std=0.0)
+    assert off._noise_pool is None

@@ -16,10 +16,14 @@ the same drive with `W = 0` and has to exceed it by `Acceptance.null_margin`.
 This is the shuffle control's logic applied to the search itself.
 
 
-*The drive is sparse and restricted to the sensory populations*, never uniform. A
-uniform current is exactly what produced the cliff, and it is a regime the real system
-never occupies — every input arrives at the lamina/medulla columns. Calibrating against
-a uniform drive tunes for a network that does not exist.
+*The drive is the encoder's own output*, never uniform and no longer a stand-in for it.
+A uniform current is exactly what produced the cliff, and it is a regime the real system
+never occupies — every input arrives at the lamina/medulla columns. But a sparse pattern
+over those columns is not what arrives either: `sensory_drive` lit 1% of the injection
+layer where `encode()` lights 62-72% of it, a 55x difference in injected current that put
+the bench at 2.20 Hz and the live loop at 4.5 Hz on the same gain. `encoder_drive` renders
+real retina sub-frames and pushes them through `encode()`, so the figure the search
+reports is the figure the loop runs at.
 
 *Failure is reported, not rounded off.* If the network jumps from silent to saturated
 with no gain in between it is bistable, not calibrated, and `CalibrationResult.success`
@@ -48,7 +52,7 @@ import argparse
 import math
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -434,6 +438,134 @@ def sensory_drive(
     return drive
 
 
+def encoder_drive(
+    connectome,
+    *,
+    params=None,
+    dt_ms: float = DEFAULT_DT_MS,
+    frame_steps: int | None = None,
+    subframes: int = SUBFRAMES_PER_TICK,
+    collision=None,
+    path_ticks: int = 128,
+    seed: int = 0,
+) -> Drive:
+    """The drive the live loop actually injects: real retina frames through `encode`.
+
+    `sensory_drive` is a sparse stand-in and it is not what the encoder produces.
+    Measured side by side on the v1 build under the calibrated `EncodeParams`
+    (i_max 24), over the injection layer's 8,877 cells:
+
+        sensory_drive     1.0% of the layer driven, flat 24.0, sum 2,136
+        encode()         62-72% of the layer driven, mean 21.3 (p10 19.6,
+                         median 22.6 = the Naka-Rushton ceiling), sum 118k-135k
+
+    A 55x difference in injected current, so a gain calibrated against the sparse
+    pattern lands the *bench* in band and the live loop at twice the rate and
+    twice the event-driven cost — which is the whole of the missed deadline. Only
+    the amplitude divergence was closed before; this closes the pattern.
+
+    The scene is a deterministic walk over the real collision grid, so the drive
+    stays a pure function of `step`: successive gains in the search must see an
+    identical input sequence or their rates are not comparable. Frames are
+    rendered a tick at a time and cached on the tick index, the same contract
+    `sensory_drive` keeps on the frame index.
+    """
+    # Deferred: `flybrain.engine` must not depend on `flybrain.sensory` or the
+    # loop. The injection layer and the raster have one definition each and this
+    # is the point of reading them rather than approximating them.
+    from flybrain.loop.types import Player, WorldState
+    from flybrain.sensory.collision import CollisionGrid
+    from flybrain.sensory.encode import EncodeParams, encode
+    from flybrain.sensory.retina import Retina
+
+    params = params if params is not None else EncodeParams()
+    collision = collision if collision is not None else CollisionGrid.load()
+    if frame_steps is None:
+        frame_steps = steps_for(FRAME_MS, dt_ms)
+    retina = Retina()
+    path = _walk(collision, path_ticks, seed)
+
+    def state(tick: int) -> WorldState:
+        x, z = path[tick % len(path)]
+        player = Player(
+            name="calibrate",
+            combat_level=3,
+            hp=10,
+            max_hp=10,
+            x=int(x),
+            z=int(z),
+            level=collision.level,
+            run_energy=100,
+            anim_id=-1,
+            in_combat=False,
+            target_index=-1,
+            target_type="none",
+            is_dead=False,
+            life_id=1,
+        )
+        return WorldState(
+            tick=tick,
+            in_game=True,
+            modal_open=False,
+            player=player,
+            npcs=(),
+            ground_items=(),
+            locs=(),
+            inventory=(),
+            skills={},
+            op_rejected_count=0,
+        )
+
+    def heading(tick: int) -> float:
+        x0, z0 = path[(tick - 1) % len(path)]
+        x1, z1 = path[tick % len(path)]
+        return math.atan2(z1 - z0, x1 - x0)
+
+    cached: dict[int, np.ndarray] = {}
+
+    def drive(step: int) -> np.ndarray:
+        tick, sub = divmod(step // frame_steps, subframes)
+        if tick not in cached:
+            cached.clear()
+            frames = retina.render_subframes(
+                state(tick - 1),
+                state(tick),
+                collision,
+                heading(tick),
+                n=subframes,
+                prev_heading=heading(tick - 1),
+            )
+            cached[tick] = np.stack([encode(f, connectome, params) for f in frames])
+        return cached[tick][sub]
+
+    return drive
+
+
+def _walk(collision, ticks: int, seed: int) -> list[tuple[int, int]]:
+    """A deterministic one-tile-per-tick walk over walkable ground.
+
+    One tile per tick because that is what the body's step command produces, and
+    the retina's flow — the only thing T4/T5 have to work with — is the
+    difference between sub-frames of exactly that motion.
+    """
+    walkable = np.argwhere(collision.grid)
+    if not walkable.size:
+        raise ValueError("collision grid has no walkable tiles to calibrate over")
+    rng = np.random.default_rng(seed)
+    i, j = walkable[len(walkable) // 2]
+    x, z = int(i) + collision.x_min, int(j) + collision.z_min
+    steps = ((1, 0), (0, 1), (-1, 0), (0, -1))
+    out = [(x, z)]
+    for _ in range(ticks - 1):
+        for k in rng.permutation(len(steps)):
+            dx, dz = steps[k]
+            if collision.is_walkable(x + dx, z + dz):
+                x, z = x + dx, z + dz
+                break
+        out.append((x, z))
+    return out
+
+
 def tonic_current(
     fraction: float, v_rest: float = DEFAULT_V_REST, v_thresh: float = DEFAULT_V_THRESH
 ) -> float:
@@ -816,6 +948,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--amplitude", type=float, default=EncodeParams().i_max)
     p.add_argument("--active-fraction", type=float, default=0.01)
     p.add_argument(
+        "--drive",
+        choices=("encoder", "synthetic"),
+        default="encoder",
+        help="encoder: real retina frames through encode(). synthetic: sensory_drive's "
+        "sparse stand-in, which drives 1%% of the injection layer where the encoder "
+        "drives 60%% — see encoder_drive",
+    )
+    p.add_argument(
         "--noise-std",
         type=float,
         default=None,
@@ -845,14 +985,25 @@ def main(argv: list[str] | None = None) -> int:
     measure_steps = steps_for(args.measure_ms, args.dt)
 
     connectome = load(args.path)
-    present = [connectome.populations[n] for n in LUMINANCE_TYPES if n in connectome.populations]
-    drive = sensory_drive(
-        connectome.n,
-        np.concatenate(present),
-        amplitude=args.amplitude,
-        active_fraction=args.active_fraction,
-        dt_ms=args.dt,
-    )
+    params = replace(EncodeParams(), i_max=args.amplitude)
+    if args.drive == "encoder":
+        drive = encoder_drive(connectome, params=params, dt_ms=args.dt)
+        described = f"encoder_drive, encode() over a walk, i_max {args.amplitude:g}"
+    else:
+        present = [
+            connectome.populations[n] for n in LUMINANCE_TYPES if n in connectome.populations
+        ]
+        drive = sensory_drive(
+            connectome.n,
+            np.concatenate(present),
+            amplitude=args.amplitude,
+            active_fraction=args.active_fraction,
+            dt_ms=args.dt,
+        )
+        described = (
+            f"sensory_drive over {'/'.join(LUMINANCE_TYPES)}, amplitude {args.amplitude:g}, "
+            f"active_fraction {args.active_fraction:g}"
+        )
     acceptance = Acceptance(target_hz=tuple(args.target), null_margin=args.null_margin)
     result = calibrate_gain(
         connectome.W,
@@ -893,10 +1044,7 @@ def main(argv: list[str] | None = None) -> int:
             acceptance=acceptance,
             rates=result.measurement.rates,
             measure_steps=measure_steps,
-            drive=(
-                f"sensory_drive over {'/'.join(LUMINANCE_TYPES)}, amplitude {args.amplitude:g}, "
-                f"active_fraction {args.active_fraction:g}, tonic {args.tonic_fraction:g}"
-            ),
+            drive=f"{described}, tonic {args.tonic_fraction:g}",
             connectome=Fingerprint.of(connectome),
         ).save(args.save)
         print(f"saved            {path}")

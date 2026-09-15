@@ -5,6 +5,29 @@ from collections import deque
 import numpy as np
 import scipy.sparse as sp
 
+#: Offsets drawn from per step, so the pool costs `N + DEFAULT_NOISE_POOL`
+#: float32 (4.7 MB at N=184,110) and repeats no sooner than this many steps.
+#: 0 disables it and restores a fresh `standard_normal` every step.
+#:
+#: `standard_normal` over every neuron was 0.436 ms of a 1.16 ms step — 131 ms
+#: of a 347 ms tick, the largest single dense cost left. Reading a rolling
+#: window out of a pre-drawn pool is 0.016 ms. It is not an approximation of
+#: the same process in the way holding a sample for k steps would be: within a
+#: step the N values are still N distinct independent draws, and neuron `i` at
+#: `t` and at `t+1` read pool entries `NOISE_STRIDE` apart, so they are
+#: independent too. What it gives up is that the pool is finite — after
+#: `DEFAULT_NOISE_POOL / gcd(stride, pool)` steps the sequence repeats, which
+#: is 1,048,576 steps, 35 minutes of biological time at dt = 2.
+DEFAULT_NOISE_POOL = 1 << 20
+
+#: Odd, so it is coprime with the power-of-two pool and successive offsets walk
+#: all of it rather than a short cycle. It is smaller than `N`, so consecutive
+#: windows do overlap: neuron `i` at `t+1` reads the entry neuron `i + stride`
+#: read at `t`. That is a cross-neuron, cross-time correlation, not one along
+#: any single neuron's own noise sequence, and `tests/test_lif.py` measures what
+#: it does to the rate distribution rather than assuming it does nothing.
+NOISE_STRIDE = 16411
+
 
 class LIFEngine:
     """Event-driven sparse leaky integrate-and-fire network.
@@ -28,6 +51,7 @@ class LIFEngine:
         refractory_ms: float = 2.0,
         transmission_delay_ms: float = 1.8,
         spontaneous_noise_std: float = 0.0,
+        noise_pool: int = DEFAULT_NOISE_POOL,
         rate_window_ms: float = 500.0,
         plastic_idx: np.ndarray | None = None,
         seed: int | None = None,
@@ -81,6 +105,14 @@ class LIFEngine:
         self.steps = 0
 
         self._rng = np.random.default_rng(seed)
+        self._noise_pool: np.ndarray | None = None
+        self._noise_offset = 0
+        if self.spontaneous_noise_std > 0.0 and noise_pool > 0:
+            self._noise_period = int(noise_pool)
+            self._noise_pool = self._rng.standard_normal(
+                self.N + self._noise_period, dtype=np.float32
+            )
+            self._noise_pool *= np.float32(self.spontaneous_noise_std)
 
     def step(self, external_current: np.ndarray | None = None) -> np.ndarray:
         if external_current is None:
@@ -100,7 +132,11 @@ class LIFEngine:
         drive += self.g
         drive -= self.w
 
-        if self.spontaneous_noise_std > 0.0:
+        if self._noise_pool is not None:
+            offset = self._noise_offset
+            drive += self._noise_pool[offset : offset + self.N]
+            self._noise_offset = (offset + NOISE_STRIDE) % self._noise_period
+        elif self.spontaneous_noise_std > 0.0:
             # float32 directly, not `normal` then cast: the draw is the single
             # largest dense cost in a step (0.65 -> 0.41 ms at N=184,110, on a
             # 1.20 ms step), and a float64 buffer over every neuron is what it

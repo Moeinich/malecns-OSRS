@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
+from flybrain.connectome import loader, vocab
 from flybrain.connectome.loader import normalize_incoming
 from flybrain.engine import calibrate as calibrate_module
 from flybrain.engine.calibrate import (
@@ -24,6 +25,7 @@ from flybrain.engine.calibrate import (
     TICK_MS,
     Acceptance,
     calibrate_gain,
+    encoder_drive,
     format_report,
     measure_gain,
     noise_std_for_dt,
@@ -432,3 +434,68 @@ def test_the_null_is_measured_once_per_search_not_once_per_bisection():
     assert runs.count(0.0) == 1  # exactly one zero-matrix run, whatever the iteration count
     assert result.null is not None
     assert result.measurement.rates.mean_hz >= result.null.rates.mean_hz * Acceptance().null_margin
+
+
+@pytest.mark.skipif(
+    not (loader.DEFAULT_PATH.exists() and vocab.DEFAULT_ANNOTATIONS_PATH.exists()),
+    reason="connectome_v1.npz or the annotations feather is missing; run the build first",
+)
+def test_the_encoder_drives_sixty_times_what_the_synthetic_pattern_does():
+    """The last live/calibration divergence, and why `encoder_drive` exists.
+
+    Only the drive's *amplitude* was ever matched to the encoder; the *pattern*
+    was not. `sensory_drive` lights 1% of the injection layer, `encode()` lights
+    62-72% of it at close to the Naka-Rushton ceiling, so calibrating on the
+    synthetic pattern put the bench at 2.20 Hz while the live loop ran 4.5 Hz —
+    and since cost is edges touched, twice the rate is twice the tick, which is
+    the whole of the missed 360 ms deadline.
+    """
+    from flybrain.connectome.loader import load
+    from flybrain.sensory.encode import LUMINANCE_TYPES, EncodeParams
+
+    c = load()
+    params = EncodeParams()
+    injection = np.unique(
+        np.concatenate([c.populations[t] for t in LUMINANCE_TYPES if t in c.populations])
+    )
+    live = encoder_drive(c, params=params)(0)
+    synthetic = sensory_drive(c.n, injection, amplitude=params.i_max)(0)
+
+    def lit(current):
+        return float((current[injection] > 0.0).mean())
+
+    print(
+        f"\ninjection layer {injection.size} cells | "
+        f"synthetic {lit(synthetic):.1%} lit, sum {synthetic.sum():.0f} | "
+        f"encoder {lit(live):.1%} lit, sum {live.sum():.0f}"
+    )
+    assert lit(synthetic) == pytest.approx(0.01, abs=0.002)
+    assert lit(live) > 0.5
+    assert live.sum() > 20.0 * synthetic.sum()
+    # Sensory indices only, either way: the drive must not leak past the layer.
+    assert np.count_nonzero(live) == np.count_nonzero(live[injection])
+
+
+@pytest.mark.skipif(
+    not (loader.DEFAULT_PATH.exists() and vocab.DEFAULT_ANNOTATIONS_PATH.exists()),
+    reason="connectome_v1.npz or the annotations feather is missing; run the build first",
+)
+def test_the_encoder_drive_is_a_pure_function_of_the_step():
+    """Successive gains in the search must see an identical input sequence.
+
+    A drive that advanced a scene on each call would hand every bisection
+    iteration a different input, and their rates would not be comparable — which
+    is how a metastable network gets mistaken for a calibrated one.
+    """
+    from flybrain.connectome.loader import load
+
+    c = load()
+    drive = encoder_drive(c, dt_ms=2.0)
+    steps = steps_for(FRAME_MS, 2.0)
+    first = drive(0).copy()
+    assert np.array_equal(drive(steps - 1), first)
+    later = drive(steps * 9).copy()
+    assert not np.array_equal(later, first)
+    # Held for a whole sub-frame, and reproduced after the cache has rolled past.
+    assert np.array_equal(drive(0), first)
+    assert np.array_equal(drive(steps * 9), later)
