@@ -2,7 +2,7 @@
 
 A real connectome with an arbitrary synaptic gain either goes silent or saturates.
 Measured on the 44,687-neuron build: 0.155 ms/step at 1% firing, 1.1 ms/step at 13%
-under a uniform drive of mu=12 — 440 ms per 400 ms tick. Cost is edges touched per
+under a uniform drive of mu=12 — 1.1 s per 600 ms tick. Cost is edges touched per
 step, so the firing rate *is* the compute budget, and the usable band has to be found
 deliberately.
 
@@ -24,7 +24,9 @@ multiplier holds the band, the upper bracket staying bimodal with 76.6% of cells
 Worse, the quiet side is *metastable*, not stable: the network reads near-zero over
 2,000 steps and tens of Hz over 8,000, because the avalanche takes seconds of simulated
 time to ignite. So `measure_steps` is part of the claim, not a tuning knob — a short
-window will call a supercritical network silent.
+window will call a supercritical network silent. The default is therefore tied to the
+timescale on which ignition was actually observed (8 s of simulated time), not to a
+round number: 2,000 steps is shorter than the phenomenon being measured.
 
 These figures are from the corrected, correctly-oriented connectome. An earlier run on a
 transposed matrix put the cliff at gain ~2.9131; fixing the orientation moved it to
@@ -60,6 +62,25 @@ SATURATION_FRACTION = 0.5
 BIMODALITY_UNIFORM = 5.0 / 9.0
 
 Drive = Callable[[int], np.ndarray]
+
+#: One game tick of simulated time at dt = 1 ms, matching `bridge/config.ts`.
+TICK_MS = 600
+#: Sub-frames per tick, as `flybrain/loop/agent.py` renders them.
+SUBFRAMES_PER_TICK = 4
+#: One encoder sub-frame. The drive is held this long because the membrane
+#: charges over tau_m; a current resampled every step charges nothing.
+FRAME_STEPS = TICK_MS // SUBFRAMES_PER_TICK
+
+#: The measurement window, in steps of dt = 1 ms.
+#:
+#: This is a claim, not a knob. The quiet branch of this network is metastable:
+#: it reads 0.072 Hz over 2,000 steps and 27.3 Hz over 8,000, because the
+#: avalanche needs seconds of simulated time to ignite. A window shorter than
+#: the ignition timescale calls a supercritical network calm, so the default is
+#: the window at which ignition was actually observed — 8 s — and the cost of
+#: the longer run is the price of the measurement being true.
+DEFAULT_MEASURE_STEPS = 8000
+DEFAULT_WARMUP_STEPS = 500
 
 
 @dataclass(frozen=True)
@@ -143,15 +164,15 @@ def sensory_drive(
     *,
     amplitude: float = 20.0,
     active_fraction: float = 0.01,
-    frame_steps: int = 100,
+    frame_steps: int = FRAME_STEPS,
     seed: int = 0,
 ) -> Drive:
     """A sparse current into `indices` — the stand-in for real encoder output.
 
     The pattern is held for `frame_steps` because the membrane charges over
     `tau_m`: a current resampled every step charges nothing and the network stays
-    silent regardless of gain. 100 steps is one of the encoder's four sub-frames
-    per 400 ms tick, so this is also what the real input looks like.
+    silent regardless of gain. The default is one of the encoder's four sub-frames
+    per 600 ms tick, so this is also what the real input looks like.
 
     Each frame is seeded from its own index rather than from a running generator,
     so the drive is a pure function of `step`. A stateful generator would hand a
@@ -198,8 +219,8 @@ def measure_gain(
     drive: Drive,
     *,
     dt_ms: float = 1.0,
-    warmup_steps: int = 500,
-    measure_steps: int = 2000,
+    warmup_steps: int = DEFAULT_WARMUP_STEPS,
+    measure_steps: int = DEFAULT_MEASURE_STEPS,
     v_thresh: np.ndarray | None = None,
     engine_kwargs: dict | None = None,
 ) -> Measurement:
@@ -241,8 +262,8 @@ def calibrate_gain(
     gain_range: tuple[float, float] = (1e-3, 10.0),
     max_iter: int = 14,
     dt_ms: float = 1.0,
-    warmup_steps: int = 500,
-    measure_steps: int = 2000,
+    warmup_steps: int = DEFAULT_WARMUP_STEPS,
+    measure_steps: int = DEFAULT_MEASURE_STEPS,
     trim_thresholds: bool = False,
     trim_rounds: int = 3,
     engine_kwargs: dict | None = None,
@@ -364,8 +385,8 @@ def _population_rates(
     named: dict[str, np.ndarray],
     *,
     dt_ms: float = 1.0,
-    warmup_steps: int = 500,
-    measure_steps: int = 2000,
+    warmup_steps: int = DEFAULT_WARMUP_STEPS,
+    measure_steps: int = DEFAULT_MEASURE_STEPS,
     engine_kwargs: dict | None = None,
 ) -> dict[str, float]:
     scaled = sp.csc_matrix(
@@ -427,8 +448,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--target", type=float, nargs=2, default=list(DEFAULT_TARGET_HZ))
     p.add_argument("--gain-range", type=float, nargs=2, default=[1e-3, 10.0])
     p.add_argument("--max-iter", type=int, default=14)
-    p.add_argument("--warmup-steps", type=int, default=500)
-    p.add_argument("--measure-steps", type=int, default=2000)
+    p.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
+    p.add_argument("--measure-steps", type=int, default=DEFAULT_MEASURE_STEPS)
     p.add_argument("--amplitude", type=float, default=20.0)
     p.add_argument("--active-fraction", type=float, default=0.01)
     p.add_argument("--trim-thresholds", action="store_true")

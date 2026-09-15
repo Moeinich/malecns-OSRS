@@ -32,12 +32,18 @@ from flybrain.sensory.retina import Retina
 #: `float32[size, size, 4]` sub-frame -> `float32[N]` injection current.
 Encoder = Callable[[np.ndarray], np.ndarray]
 
+#: Only used when the sidecar has not said otherwise. Mirrors `DEFAULT_TICK_MS`
+#: in `bridge/config.ts`; real Old School RuneScape runs at 600 ms.
+DEFAULT_TICK_MS = 600
+
 
 @dataclass(frozen=True)
 class AgentParams:
     subframes: int = 4
-    #: 4 x 100 substeps at dt = 1 ms covers a 400 ms game tick.
-    substeps_per_subframe: int = 100
+    #: None derives it from the tick the sidecar reports, so the brain simulates
+    #: exactly one tick of biological time whatever the server is running
+    #: (600 ms / 4 sub-frames / dt 1 ms = 150). An explicit count overrides it.
+    substeps_per_subframe: int | None = None
     rate_window_steps: int | None = None
     #: Fraction of the sidecar's stated deadline we are willing to spend.
     deadline_fraction: float = 1.0
@@ -133,6 +139,7 @@ class Agent:
         )
         t_retina = time.perf_counter()
 
+        per_subframe = self.substeps_per_subframe
         ms_encode = 0.0
         ms_lif = 0.0
         substeps = 0
@@ -141,12 +148,12 @@ class Agent:
             a = time.perf_counter()
             current = self.encoder(frame)
             b = time.perf_counter()
-            for _ in range(p.substeps_per_subframe):
+            for _ in range(per_subframe):
                 self.engine.step(current)
             c = time.perf_counter()
             ms_encode += (b - a) * 1e3
             ms_lif += (c - b) * 1e3
-            substeps += p.substeps_per_subframe
+            substeps += per_subframe
             # Send what we have rather than stall the gateway: a late command is
             # worse than a coarse one, because the sidecar will dispatch the
             # continuation policy and our revision goes stale.
@@ -192,6 +199,26 @@ class Agent:
         self._ms_lif += report.ms_lif
         self.last = report
         return report
+
+    @property
+    def tick_ms(self) -> int:
+        """The game tick the sidecar reported, or the default until it has."""
+        ready = self.client.ready
+        return ready.tick_ms if ready is not None else DEFAULT_TICK_MS
+
+    @property
+    def substeps_per_subframe(self) -> int:
+        """Derived from the reported tick unless `AgentParams` pins a count.
+
+        Hardcoding the count is the real bug risk: the number would be right
+        only for the tickrate it was written against, and a server started at a
+        different one would leave the brain silently simulating the wrong amount
+        of time per decision with nothing reporting it.
+        """
+        pinned = self.params.substeps_per_subframe
+        if pinned is not None:
+            return pinned
+        return max(1, round(self.tick_ms / self.engine.dt_ms / self.params.subframes))
 
     # --------------------------------------------------------------- health
 
@@ -344,6 +371,7 @@ def _sort_columns(indices: np.ndarray, data: np.ndarray, indptr: np.ndarray) -> 
 
 
 __all__ = [
+    "DEFAULT_TICK_MS",
     "Ablation",
     "Agent",
     "AgentParams",

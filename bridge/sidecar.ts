@@ -36,10 +36,59 @@ type ClientSocket = Socket<ClientCtx>;
 
 const log = (message: string) => console.error(`[bridge] ${message}`);
 
+/** Relative disagreement between configured and observed tick we tolerate in silence. */
+const TICK_TOLERANCE = 0.1;
+/** Enough distinct ticks for the median to mean anything. */
+const TICK_MIN_SAMPLES = 8;
+const TICK_WINDOW = 21;
+/** A larger gap is a respawn or a stall, not a tick rate. */
+const TICK_MAX_GAP = 4;
+
+/**
+ * The tick, measured rather than trusted.
+ *
+ * `RS_TICK_MS` is an env var nothing validates against the engine it describes.
+ * If the engine runs at 600 and the env says 400, the deadline is 60% of the
+ * wrong number, the continuation policy fires early every tick, and every
+ * `brainOverrun` we report is wrong — silently, because nothing compares them.
+ */
+class TickMeter {
+    private readonly intervals: number[] = [];
+    private lastTick = -1;
+    private lastAt = 0;
+    /** Rolling median of the per-tick interval, once there are enough samples. */
+    observedMs: number | null = null;
+
+    /**
+     * Feed every state publication. The SDK republishes ~8x per game tick, so
+     * only a change in `tick` is a sample; dividing by the tick delta keeps
+     * conflated or skipped ticks from reading as a slower server.
+     */
+    sample(tick: number, now: number): void {
+        const gap = tick - this.lastTick;
+        if (this.lastTick >= 0 && gap > 0 && gap <= TICK_MAX_GAP) {
+            this.intervals.push((now - this.lastAt) / gap);
+            if (this.intervals.length > TICK_WINDOW) this.intervals.shift();
+            if (this.intervals.length >= TICK_MIN_SAMPLES) this.observedMs = median(this.intervals);
+        }
+        if (gap > 0) {
+            this.lastTick = tick;
+            this.lastAt = now;
+        }
+    }
+}
+
+function median(values: number[]): number {
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = sorted.length >> 1;
+    return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
 class Sidecar {
     private readonly normalizer = new StateNormalizer();
     private readonly clients = new Set<ClientSocket>();
-    private readonly deadlineMs: number;
+    private readonly meter = new TickMeter();
+    private deadlineMs: number;
     private dispatcher!: ActionDispatcher;
     private ready: ReadyMsg | null = null;
     private nextClientId = 1;
@@ -54,9 +103,12 @@ class Sidecar {
 
     /** Health counters, for the dashboard. */
     readonly health = { droppedStates: 0, brainOverrun: 0, opRejected: 0 };
+    /** Configured vs observed tick, and the one the deadline is actually derived from. */
+    readonly tick: { configuredMs: number; observedMs: number | null; effectiveMs: number };
 
     constructor(private readonly cfg: BridgeConfig) {
         this.deadlineMs = Math.round(cfg.tickMs * cfg.deadlineFraction);
+        this.tick = { configuredMs: cfg.tickMs, observedMs: null, effectiveMs: cfg.tickMs };
     }
 
     async start(): Promise<{ sdk: Sdk; bot: Bot }> {
@@ -178,6 +230,7 @@ class Sidecar {
             }
             return;
         }
+        this.measureTick(raw.tick);
         // Conflation, depth 1: hold exactly one pending state, never a queue.
         // A queue would put the brain progressively behind reality while it
         // believes it is current.
@@ -187,6 +240,35 @@ class Sidecar {
         }
         this.pending = this.normalizer.normalize(raw);
         this.beginIfDue();
+    }
+
+    /**
+     * Prefer what the engine does over what the env var claims: a deadline built
+     * on the wrong tick corrupts every overrun measurement it produces.
+     */
+    private measureTick(tick: number): void {
+        this.meter.sample(tick, Date.now());
+        const observed = this.meter.observedMs;
+        if (observed === null) return;
+        this.tick.observedMs = observed;
+        // Hysteresis against the value in force, not against the configured one:
+        // the median jitters a few ms either side and would otherwise re-decide,
+        // and re-log, every tick.
+        const inForce = this.tick.effectiveMs;
+        if (Math.abs(observed - inForce) / inForce <= TICK_TOLERANCE) return;
+
+        const agrees = Math.abs(observed - this.cfg.tickMs) / this.cfg.tickMs <= TICK_TOLERANCE;
+        const effective = agrees ? this.cfg.tickMs : Math.round(observed / 10) * 10;
+        this.tick.effectiveMs = effective;
+        this.deadlineMs = Math.round(effective * this.cfg.deadlineFraction);
+        log(
+            agrees
+                ? `tick back in agreement: configured ${this.cfg.tickMs} ms, observed ${observed.toFixed(1)} ms`
+                : `TICK MISMATCH: configured ${this.cfg.tickMs} ms (RS_TICK_MS), observed ` +
+                  `${observed.toFixed(1)} ms. Using the observed ${effective} ms for the deadline ` +
+                  `(${this.deadlineMs} ms). Start the engine with NODE_TICKRATE=${this.cfg.tickMs}, ` +
+                  `or set RS_TICK_MS=${effective} to match the engine that is running.`,
+        );
     }
 
     /** The SDK republishes several times per game tick; the brain acts on the first of each. */

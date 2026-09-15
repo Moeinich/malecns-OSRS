@@ -20,6 +20,15 @@ export interface BridgeConfig {
 
 const DEFAULT_SDK_PATH = new URL("../vendor/rs-sdk/sdk/", import.meta.url).href;
 
+/**
+ * Real Old School RuneScape runs at 600 ms. LostCity's engine defaults to 400
+ * (`Environment.ts:54`), so every process in the stack has to be told 600 —
+ * `scripts/dev.sh` passes `NODE_TICKRATE`, this is the sidecar's half. A low
+ * tickrate for fast training runs stays available through `RS_TICK_MS`, which
+ * must then match whatever the engine was started with.
+ */
+export const DEFAULT_TICK_MS = 600;
+
 export function loadConfig(): BridgeConfig {
     const env = process.env;
     const username = env.RS_BOT_USERNAME || "flybot01";
@@ -33,7 +42,7 @@ export function loadConfig(): BridgeConfig {
         sdkPath: env.RS_SDK_PATH ? new URL("./", `file://${env.RS_SDK_PATH}/`).href : DEFAULT_SDK_PATH,
         socketPath: env.RS_BRIDGE_SOCKET || `/tmp/malecns-osrs/${username}.sock`,
         mode: env.RS_MODE === "observe" ? "observe" : "control",
-        tickMs: Number(env.RS_TICK_MS || 400),
+        tickMs: Number(env.RS_TICK_MS) || DEFAULT_TICK_MS,
         deadlineFraction: 0.6,
     };
 }

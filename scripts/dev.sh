@@ -6,7 +6,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RS_SDK="$REPO_ROOT/vendor/rs-sdk"
 
-TICKRATE=""
+# Real OSRS runs at 600 ms; the engine's own default is 400 (Environment.ts:54),
+# so it has to be told. --tickrate keeps fast training runs available.
+TICKRATE="600"
 BOT_NAME="flybot01"
 
 while [[ $# -gt 0 ]]; do
@@ -92,6 +94,10 @@ printf "%-14s %-18s %-9s %s\n" "SERVICE" "STATUS" "PORT" "LOG"
 printf "%-14s %-18s %-9s %s\n" "engine" "$ENGINE_STATUS" "8888" "$ENGINE_LOG"
 printf "%-14s %-18s %-9s %s\n" "gateway" "$GATEWAY_STATUS" "7780" "$GATEWAY_LOG"
 printf "%-14s %-18s %-9s %s\n" "lite ($BOT_NAME)" "$LITE_STATUS" "-" "$LITE_LOG"
+# Only honoured if this script actually started the engine; an already-running one
+# keeps whatever it was started with, which is what the sidecar's meter catches.
+echo
+echo "tickrate       ${TICKRATE} ms  (export RS_TICK_MS=${TICKRATE} for the sidecar)"
 
 if [[ "$ENGINE_STATUS" == FAILED* || "$GATEWAY_STATUS" == FAILED* || "$LITE_STATUS" == FAILED* ]]; then
   exit 1

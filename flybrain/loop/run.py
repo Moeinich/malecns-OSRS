@@ -44,7 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="compute everything, send noop — watch the brain without moving the bot",
     )
     p.add_argument("--status-every", type=int, default=25)
-    p.add_argument("--substeps", type=int, default=100, help="LIF steps per sub-frame")
+    p.add_argument(
+        "--substeps",
+        type=int,
+        default=None,
+        help="LIF steps per sub-frame; default derives it from the tick the sidecar reports",
+    )
     return p
 
 
@@ -100,6 +105,8 @@ def _summary(agent: Agent, ablation: Ablation, elapsed: float) -> str:
     return (
         f"\n--- {ablation.label} ---\n"
         f"ticks           {agent.ticks} in {elapsed:.1f} s\n"
+        f"tick budget     {agent.tick_ms} ms -> "
+        f"{agent.params.subframes} x {agent.substeps_per_subframe} substeps\n"
         f"ms/tick         {agent.mean_ms_per_tick:.1f} (LIF {agent.mean_ms_lif:.1f})\n"
         f"overruns        {agent.overruns}\n"
         f"dropped ticks   {agent.client.dropped_game_ticks}\n"

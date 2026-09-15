@@ -34,15 +34,17 @@ from flybrain.sensory.retina import CH_LOOT, CH_LUMINANCE, CH_THREAT, Retina
 
 # ------------------------------------------------------------ fake sidecar
 
-READY = {
-    "t": "ready",
-    "protocol": 1,
-    "username": "flybot01",
-    "mode": "control",
-    "role": "brain",
-    "tickMs": 400,
-    "pathfindingWarm": True,
-}
+
+def ready_msg(tick_ms: int = 600) -> dict:
+    return {
+        "t": "ready",
+        "protocol": 1,
+        "username": "flybot01",
+        "mode": "control",
+        "role": "brain",
+        "tickMs": tick_ms,
+        "pathfindingWarm": True,
+    }
 
 
 def _npc(index: int, x: int, z: int, level: int = 20) -> dict:
@@ -64,13 +66,13 @@ def _npc(index: int, x: int, z: int, level: int = 20) -> dict:
     }
 
 
-def state_msg(revision: int, x: int, z: int, npcs=(), items=()) -> dict:
+def state_msg(revision: int, x: int, z: int, npcs=(), items=(), deadline_ms: int = 360) -> dict:
     return {
         "t": "state",
         "revision": revision,
         "tick": 88000 + revision,
         "droppedSinceLast": 0,
-        "deadlineMs": 240,
+        "deadlineMs": deadline_ms,
         "state": {
             "tick": 88000 + revision,
             "inGame": True,
@@ -104,9 +106,10 @@ def state_msg(revision: int, x: int, z: int, npcs=(), items=()) -> dict:
 class FakeSidecar:
     """Accepts one brain, replays a script of states, drains whatever comes back."""
 
-    def __init__(self, path: str, script: list[dict]) -> None:
+    def __init__(self, path: str, script: list[dict], tick_ms: int = 600) -> None:
         self.path = path
         self.script = script
+        self.ready = ready_msg(tick_ms)
         self.received: list[dict] = []
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(path)
@@ -117,7 +120,7 @@ class FakeSidecar:
     def _serve(self) -> None:
         conn, _ = self.listener.accept()
         with conn:
-            conn.sendall((json.dumps(READY) + "\n").encode())
+            conn.sendall((json.dumps(self.ready) + "\n").encode())
             for msg in self.script:
                 conn.sendall((json.dumps(msg) + "\n").encode())
             buffer = b""
@@ -253,16 +256,16 @@ def _agent(sidecar: FakeSidecar, W: sp.csc_matrix, **params) -> Agent:
         collision=_collision(),
         encoder=_encoder,
         retina=Retina(),
-        params=AgentParams(substeps_per_subframe=params.pop("substeps", 100), **params),
+        params=AgentParams(substeps_per_subframe=params.pop("substeps", None), **params),
     )
 
 
-def run_condition(ablation: Ablation | None, n_ticks: int = 12, **params):
+def run_condition(ablation: Ablation | None, n_ticks: int = 12, tick_ms: int = 600, **params):
     connectome = _connectome()
     W = ablation.apply(connectome) if ablation is not None else connectome.W.copy()
     # Not pytest's tmp_path: those paths overflow the 104-byte AF_UNIX limit.
     with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
-        sidecar = FakeSidecar(f"{tmp}/b.sock", _script(n_ticks))
+        sidecar = FakeSidecar(f"{tmp}/b.sock", _script(n_ticks), tick_ms=tick_ms)
         agent = _agent(sidecar, W, **params)
         try:
             with agent.client:
@@ -292,8 +295,19 @@ def test_a_synthetic_state_produces_a_well_formed_action():
             "idle",
         }
     assert agent.last is not None
-    assert agent.last.substeps == 400
+    assert agent.last.substeps == 600  # 4 sub-frames x 150, derived from the 600 ms tick
     assert all(r.mean_rate_hz >= 0.0 for r in reports)
+
+
+def test_substeps_follow_the_tick_the_sidecar_reports():
+    """The count is derived, not hardcoded: a server at another tickrate must not
+    leave the brain simulating the wrong amount of biological time per decision."""
+    fast, _, _ = run_condition(None, n_ticks=4, tick_ms=100)
+    assert fast.tick_ms == 100
+    assert fast.last.substeps == 100  # 4 x 25
+
+    pinned, _, _ = run_condition(None, n_ticks=4, tick_ms=100, substeps=50)
+    assert pinned.last.substeps == 200  # an explicit override still wins
 
 
 def test_dry_run_sends_noop_but_still_computes():
@@ -313,7 +327,7 @@ def test_the_loop_keeps_up(capsys):
             f"decode {np.mean([r.ms_decode for r in reports]):.2f})"
         )
     assert agent.overruns == 0
-    assert agent.mean_ms_per_tick < 240.0
+    assert agent.mean_ms_per_tick < 360.0  # 60% of a 600 ms tick
 
 
 # ------------------------------------------------------------- ablations

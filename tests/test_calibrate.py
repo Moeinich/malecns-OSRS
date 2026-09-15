@@ -8,7 +8,10 @@ import scipy.sparse as sp
 
 from flybrain.engine.calibrate import (
     BIMODALITY_UNIFORM,
+    FRAME_STEPS,
     SATURATION_FRACTION,
+    SUBFRAMES_PER_TICK,
+    TICK_MS,
     calibrate_gain,
     format_report,
     measure_gain,
@@ -141,6 +144,15 @@ def test_sensory_drive_holds_a_pattern_for_a_whole_frame():
     assert not np.array_equal(drive(0), drive(10))
     assert np.count_nonzero(drive(0)) == 5
     assert np.count_nonzero(drive(0)[20:]) == 0
+
+
+def test_the_drive_frame_is_one_sub_frame_of_a_real_tick():
+    """Calibrating against an input shape the encoder never produces tunes for a
+    network that does not exist, so the default frame is derived from the tick."""
+    assert (TICK_MS, SUBFRAMES_PER_TICK, FRAME_STEPS) == (600, 4, 150)
+    drive = sensory_drive(50, np.arange(20), active_fraction=0.25)
+    assert np.array_equal(drive(0), drive(FRAME_STEPS - 1))
+    assert not np.array_equal(drive(0), drive(FRAME_STEPS))
 
 
 @pytest.mark.skipif(
