@@ -15,7 +15,6 @@ from flybrain.sensory.encode import EncodeParams, encode, map_builds
 from flybrain.sensory.retina import CH_LUMINANCE, CH_THREAT, N_CHANNELS
 
 SIZE = 60
-N_NEURONS = 44_687
 
 needs_artifacts = pytest.mark.skipif(
     not (DEFAULT_PATH.exists() and vocab.DEFAULT_ANNOTATIONS_PATH.exists()),
@@ -81,8 +80,9 @@ def test_naka_rushton_saturates_rather_than_growing_without_bound():
 def test_vector_is_float32_over_the_whole_network(connectome):
     out = encode(_frame(), connectome)
     assert out.dtype == np.float32
-    assert out.shape == (N_NEURONS,)
-    assert connectome.n == N_NEURONS
+    # Derived from the artifact, not pinned: the claim is that the encoder covers
+    # exactly the network it was given, which stays true across rebuilds.
+    assert out.shape == (connectome.n,)
 
 
 @needs_artifacts

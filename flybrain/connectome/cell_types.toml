@@ -105,3 +105,38 @@ role = "fan-shaped body; real types are FB1A/FB2B/..., so only a prefix resolves
 required = false
 expect = 1773
 role = "ON relay, L1 -> Mi1 -> T4; without it the anchored L1 has no route onward"
+
+[Tm3]
+required = false
+expect = 2055
+role = "ON fast columnar input to T4, alongside Mi1; boundary match keeps Tm30..Tm39 out"
+
+[Mi4]
+required = false
+expect = 1772
+role = "ON delayed input to T4 (GABAergic); the delay line direction selectivity needs"
+
+[Mi9]
+required = false
+expect = 1775
+role = "ON delayed input to T4 (glutamatergic); boundary match keeps Mi90-style names out"
+
+[C2]
+required = false
+expect = 1745
+role = "centrifugal feedback onto the lamina/medulla column; takes 1,801 L1 out-edges"
+
+[C3]
+required = false
+expect = 1779
+role = "centrifugal input to T4; boundary match, since a prefix would pool C2 and C30+"
+
+[L5]
+required = false
+expect = 1787
+role = "lamina, ON pathway; takes 1,885 L1 out-edges but is not itself injected into"
+
+[CT1]
+required = false
+expect = 2
+role = "two giant wide-field cells, one per optic lobe; the shared inhibitory partner of T4/T5"

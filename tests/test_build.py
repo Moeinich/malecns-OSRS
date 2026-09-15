@@ -8,7 +8,6 @@ bodyIds in the provenance are the ones in the release.
 from __future__ import annotations
 
 import itertools
-import os
 
 import numpy as np
 import pytest
@@ -29,13 +28,16 @@ pytestmark = pytest.mark.skipif(
     reason="MaleCNS release not fetched; run tools/fetch_connectome.py",
 )
 
-SMALL_K = 2000
+#: The shipped K. A reduced K was here to keep the suite fast, but selection
+#: costs 0.5 s of a ~4 s build, so the saving bought nothing and the assertions
+#: below then held only for a network we do not run.
+BUILD_K = SelectionParams.k
 
 
 @pytest.fixture(scope="module")
 def built(tmp_path_factory):
     out = tmp_path_factory.mktemp("connectome") / "connectome_test.npz"
-    provenance = build(out, SelectionParams(k=SMALL_K), BuildParams())
+    provenance = build(out, SelectionParams(k=BUILD_K), BuildParams())
     return out, provenance
 
 
@@ -135,25 +137,55 @@ def test_descending_neurons_are_convergent_inside_this_subgraph(connectome):
     assert in_degree > 2 * out_degree, f"DNp01 in={in_degree:.1f} out={out_degree:.1f}"
 
 
-def test_injection_layer_drives_the_network(connectome):
-    """The cells the retina writes into must drive far more than they receive.
+@pytest.mark.parametrize("name", select_mod.VISUAL_INPUT_TYPES + select_mod.ON_RELAY_TYPES)
+def test_every_injection_and_relay_type_drives_the_network(connectome, name):
+    """Each type on its own, never pooled.
 
-    Per type rather than in aggregate would be the stronger claim, but L1 is
-    near-isolated in this subgraph (out-degree 1.14, in-degree 1.14 at full K)
-    and carries no directional signal at all; the layer as a whole does.
+    The aggregate mean used to clear this bar at ~19 while L1 sat at 1.14,
+    because L1's real targets were outside the subgraph. A pooled assertion
+    cannot tell a wired population from a present one.
     """
+    idx = connectome.population(name)
+    assert idx.size, f"{name} is absent from the subgraph"
+    out_degree = np.diff(connectome.W.indptr)[idx].mean()
+    assert out_degree > 5, f"{name} out-degree {out_degree:.2f}"
+
+
+def test_injection_layer_is_directional(connectome):
+    """The cells the retina writes into must drive more than they receive."""
     idx = np.unique(
-        np.concatenate(
-            [
-                connectome.population(name)
-                for name in select_mod.VISUAL_INPUT_TYPES + select_mod.ON_RELAY_TYPES
-            ]
-        )
+        [i for name in select_mod.VISUAL_INPUT_TYPES for i in connectome.population(name)]
     )
     out_degree = np.diff(connectome.W.indptr)[idx].mean()
     in_degree = np.diff(connectome.W.tocsr().indptr)[idx].mean()
-    assert out_degree > 5
     assert out_degree > 1.5 * in_degree, f"injection out={out_degree:.1f} in={in_degree:.1f}"
+
+
+#: T4's columnar inputs, split by the role they play in the elementary motion
+#: detector. One input from each half is the minimum for direction selectivity.
+T4_FAST_INPUTS = ("Mi1", "Tm3")
+T4_DELAY_INPUTS = ("Mi4", "Mi9", "C3")
+
+
+def _edges_into(connectome, post: str, pre: str) -> int:
+    rows = connectome.population(post)
+    cols = connectome.population(pre)
+    if rows.size == 0 or cols.size == 0:
+        return 0
+    return connectome.W[:, cols].tocsr()[rows].nnz
+
+
+def test_t4_receives_both_a_fast_and_a_delayed_columnar_input(connectome):
+    """A T4 with one input integrates; it does not compute direction.
+
+    Counting edges per presynaptic type is the assertion that distinguishes
+    "the population is in the subgraph" from "the population is wired to T4".
+    """
+    counts = {
+        name: _edges_into(connectome, "T4", name) for name in T4_FAST_INPUTS + T4_DELAY_INPUTS
+    }
+    assert any(counts[n] for n in T4_FAST_INPUTS), counts
+    assert any(counts[n] for n in T4_DELAY_INPUTS), counts
 
 
 def test_csc_and_csr_agree(built, connectome):
@@ -178,7 +210,7 @@ def test_provenance_records_sources_and_parameters(built):
     _, provenance = built
     for name, source in provenance["sources"].items():
         assert source["sha256"] and name in source["url"]
-    assert provenance["selection"]["k"] == SMALL_K
+    assert provenance["selection"]["k"] == BUILD_K
     assert provenance["selection"]["achieved_min_syn"] >= provenance["selection"]["min_syn"]
     assert provenance["achieved"]["n_edges"] <= SelectionParams().max_edges
 
@@ -215,11 +247,7 @@ def test_population_lookup_refuses_an_unbuilt_name(connectome):
         connectome.population("DNa02", "M")
 
 
-@pytest.mark.skipif(
-    not os.environ.get("FLYBRAIN_SLOW"),
-    reason="full-K build is a manual path; set FLYBRAIN_SLOW=1",
-)
-def test_full_k_build(tmp_path):
-    provenance = build(tmp_path / "full.npz", SelectionParams(), BuildParams())
+def test_the_build_is_the_size_it_claims(built):
+    _, provenance = built
     assert provenance["achieved"]["n_neurons"] > 20_000
     assert provenance["achieved"]["n_edges"] <= SelectionParams().max_edges

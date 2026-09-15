@@ -39,11 +39,15 @@ VISUAL_INPUT_TYPES = ("L1", "L2", "L3", "Tm1")
 #: without them computes no optic flow at all.
 MOTION_DETECTOR_TYPES = ("T4", "T5")
 
-#: The ON relay between injection and motion detection: L1 -> Mi1 -> T4. The
-#: OFF leg needs nothing extra, since its relay Tm1 is already an injection
-#: site. Without Mi1 the anchored L1 cells have no partner inside the subgraph
-#: at all and are dropped again as an isolated component.
-ON_RELAY_TYPES = ("Mi1",)
+#: The columnar medulla layer between the injection sites and the motion
+#: detectors. Mi1 alone is not enough: it carries only 1,818 of L1's 16,023
+#: out-edges, and T4 needs a fast input *and* a delayed one to be direction
+#: selective. Mi1/Tm3 are the fast leg, Mi4/Mi9/C3 the delayed and inhibitory
+#: one, CT1 the wide-field partner; L5 and C2 are here because they take 3,686
+#: further L1 out-edges, which is what lifts L1 off the floor. None of them
+#: survive the top-K PPR cut (Tm3 scores 2.57e-06 against a cut of 6.50e-06),
+#: so each has to be forced in by name.
+ON_RELAY_TYPES = ("Mi1", "Tm3", "Mi4", "Mi9", "C2", "C3", "L5", "CT1")
 
 #: Named populations forced into the subgraph. The mushroom body is where
 #: learning lives; the central complex is the heading compass.
