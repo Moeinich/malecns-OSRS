@@ -1,0 +1,4 @@
+.DS_Store
+
+# Machine-local permissions and paths; never shared.
+.claude/settings.local.json
