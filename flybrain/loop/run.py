@@ -11,6 +11,13 @@ import sys
 import time
 
 from flybrain.connectome.loader import DEFAULT_PATH, load
+from flybrain.engine.calibration import (
+    DEFAULT_CALIBRATION_PATH,
+    UNCALIBRATED,
+    UNCALIBRATED_BANNER,
+    Calibration,
+)
+from flybrain.engine.calibration import load as load_calibration
 from flybrain.engine.lif import LIFEngine
 from flybrain.loop.agent import Ablation, Agent, AgentParams, default_encoder
 from flybrain.loop.client import BridgeClient, default_socket_path
@@ -23,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--socket", default=None, help="unix socket to the sidecar")
     p.add_argument("--connectome", default=str(DEFAULT_PATH))
     p.add_argument("--collision", default=str(DEFAULT_COLLISION_PATH))
+    p.add_argument(
+        "--calibration",
+        default=str(DEFAULT_CALIBRATION_PATH),
+        help="tuned gain and membrane noise; missing is loud, stale is fatal",
+    )
     p.add_argument(
         "--lesion",
         action="append",
@@ -68,12 +80,20 @@ def main(argv: list[str] | None = None) -> int:
         shuffle=args.shuffle,
         seed=args.seed,
     )
-    W = ablation.apply(connectome)
+    calibration = load_calibration(args.calibration, connectome)
+    if calibration is None:
+        print(UNCALIBRATED_BANNER, file=sys.stderr)
+        calibration = UNCALIBRATED
+
+    # Scaled after the ablation, which already copied: the cached `connectome.W`
+    # the loader hands out as the one weight array is never touched.
+    W = calibration.apply(ablation.apply(connectome))
     print(f"condition: {ablation.label}", file=sys.stderr)
     for note in ablation.notes:
         print(f"  {note}", file=sys.stderr)
+    print(f"calibration: {calibration.describe()}", file=sys.stderr)
 
-    engine = LIFEngine(W, seed=args.seed)
+    engine = LIFEngine(W, seed=args.seed, **calibration.engine_kwargs())
     # Imported only here: the brain must not depend on OpenCV being installed.
     hud = None
     feed = None
@@ -96,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         engine=engine,
         motor=MotorIndex.from_connectome(connectome),
         collision=CollisionGrid.load(args.collision),
-        encoder=default_encoder(connectome),
+        encoder=default_encoder(connectome, calibration.encode_params()),
         params=AgentParams(substeps_per_subframe=args.substeps, dry_run=args.dry_run),
         spike_sink=hud.record_spikes if hud is not None and hud.enabled else None,
     )
@@ -116,7 +136,10 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if hud is not None:
             hud.close()
-        print(_summary(agent, ablation, time.monotonic() - started), file=sys.stderr)
+        print(
+            _summary(agent, ablation, calibration, time.monotonic() - started),
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -129,7 +152,7 @@ def _status(agent: Agent, r) -> str:
     )
 
 
-def _summary(agent: Agent, ablation: Ablation, elapsed: float) -> str:
+def _summary(agent: Agent, ablation: Ablation, calibration: Calibration, elapsed: float) -> str:
     counts = ", ".join(f"{k}={v}" for k, v in sorted(agent.action_counts.items())) or "none"
     rate = f"{agent.last.mean_rate_hz:.2f} Hz" if agent.last is not None else "n/a"
     return (
@@ -140,6 +163,7 @@ def _summary(agent: Agent, ablation: Ablation, elapsed: float) -> str:
         f"ms/tick         {agent.mean_ms_per_tick:.1f} (LIF {agent.mean_ms_lif:.1f})\n"
         f"overruns        {agent.overruns}\n"
         f"dropped ticks   {agent.client.dropped_game_ticks}\n"
+        f"calibration     {calibration.describe()}\n"
         f"mean rate       {rate}\n"
         f"actions         {counts}"
     )
