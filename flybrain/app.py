@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -40,6 +41,9 @@ GRACE_SECONDS = 5.0
 
 LONG = "long"
 SHORT = "short"
+
+LITE = "lite"
+BROWSER = "browser"
 
 
 @dataclass(frozen=True)
@@ -62,7 +66,44 @@ class Service:
         return run_dir / "logs" / f"{self.name}.log"
 
 
-def default_services(tickrate: int = DEFAULT_TICKRATE, bot: str = DEFAULT_BOT) -> list[Service]:
+def _client_service(client: str, bot: str) -> Service:
+    """The one game client. The gateway pairs one per username, so `browser`
+    replaces `lite` rather than joining it — connecting a second would fight the
+    first for the account.
+
+    Lite has no renderer by design, so the HUD's game panel is empty under it;
+    `browser` is headless Chrome on `/bot`, publishing frames for
+    `flybrain.gamefeed`. It costs a Chromium, which is why it is not the default,
+    and it needs the client bundle built once:
+    `cd vendor/rs-sdk/server/webclient && BUILD_MODE=bot bun run bundle.ts`.
+    """
+    prepare = [str(REPO_ROOT / "scripts" / "bot-env.sh"), bot]
+    if client == BROWSER:
+        return Service(
+            name="browser",
+            tier=LONG,
+            argv=["bun", "bridge/game-feed.ts"],
+            cwd=REPO_ROOT,
+            env={"RS_BOT_USERNAME": bot},
+            pattern="bridge/game-feed.ts",
+            ready="game-feed: ready on",
+            ready_timeout=150.0,
+            prepare=prepare,
+        )
+    return Service(
+        name="lite",
+        tier=LONG,
+        argv=["bun", "src/lite/runner.ts", bot],
+        cwd=RS_SDK / "server" / "webclient",
+        pattern=f"src/lite/runner.ts {bot}",
+        ready="Gateway connected, registering as",
+        prepare=prepare,
+    )
+
+
+def default_services(
+    tickrate: int = DEFAULT_TICKRATE, bot: str = DEFAULT_BOT, client: str = LITE
+) -> list[Service]:
     """The real stack, in start order.
 
     `BUILD_VERIFY=false` or the engine aborts on a `.loc` checksum mismatch.
@@ -89,15 +130,7 @@ def default_services(tickrate: int = DEFAULT_TICKRATE, bot: str = DEFAULT_BOT) -
             port=7780,
             ready="Gateway running",
         ),
-        Service(
-            name="lite",
-            tier=LONG,
-            argv=["bun", "src/lite/runner.ts", bot],
-            cwd=RS_SDK / "server" / "webclient",
-            pattern=f"src/lite/runner.ts {bot}",
-            ready="Gateway connected, registering as",
-            prepare=[str(REPO_ROOT / "scripts" / "bot-env.sh"), bot],
-        ),
+        _client_service(client, bot),
         Service(
             name="sidecar",
             tier=SHORT,
@@ -113,6 +146,17 @@ def default_services(tickrate: int = DEFAULT_TICKRATE, bot: str = DEFAULT_BOT) -
         # job. Nothing else has to change — tier membership is the whole
         # contract, and `restart-short` will pick them up for free.
     ]
+
+
+def _prepare_env(service: Service) -> dict[str, str]:
+    if not service.prepare:
+        return {}
+    out = subprocess.run(service.prepare, check=True, capture_output=True, text=True)
+    return dict(
+        line.split("=", 1)
+        for line in out.stdout.splitlines()
+        if re.match(r"^[A-Z][A-Z0-9_]*=", line)
+    )
 
 
 def port_listening(port: int) -> bool:
@@ -226,14 +270,15 @@ class Supervisor:
         log = service.log_path(self.run_dir)
         log.parent.mkdir(parents=True, exist_ok=True)
 
-        if service.prepare:
-            subprocess.run(service.prepare, check=True, capture_output=True, text=True)
+        # `KEY=VALUE` lines from prepare become child env: that is how the bot
+        # password reaches the client without anything here parsing bot.env.
+        prepared = _prepare_env(service)
 
         with open(log, "wb") as handle:
             proc = subprocess.Popen(
                 service.argv,
                 cwd=service.cwd,
-                env={**os.environ, **service.env},
+                env={**os.environ, **prepared, **service.env},
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
@@ -394,6 +439,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tickrate", type=int, default=DEFAULT_TICKRATE)
     parser.add_argument("--bot", default=DEFAULT_BOT)
     parser.add_argument(
+        "--client",
+        choices=[LITE, BROWSER],
+        default=LITE,
+        help="lite: headless, no pixels. browser: Chromium on /bot, feeding the HUD",
+    )
+    parser.add_argument(
         "--adopt",
         action="store_true",
         help="take ownership of services that are already running",
@@ -408,7 +459,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    sup = Supervisor(default_services(args.tickrate, args.bot))
+    sup = Supervisor(default_services(args.tickrate, args.bot, args.client))
     tiers = (LONG,) if args.long_only else (LONG, SHORT)
 
     if args.command == "status":

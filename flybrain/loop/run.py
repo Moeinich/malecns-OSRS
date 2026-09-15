@@ -76,8 +76,12 @@ def main(argv: list[str] | None = None) -> int:
     engine = LIFEngine(W, seed=args.seed)
     # Imported only here: the brain must not depend on OpenCV being installed.
     hud = None
+    feed = None
     if args.hud:
+        from flybrain.gamefeed import GameFeed
         from flybrain.hud import Hud
+
+        feed = GameFeed()
 
         hud = Hud.create(
             populations=connectome.populations,
@@ -102,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
         with agent.client:
             for report in agent.run(args.ticks):
                 if hud is not None:
+                    if feed is not None and hud.should_draw(report.overrun):
+                        hud.game_frame = feed.read()
                     hud.update(agent, report)
                 if args.status_every and agent.ticks % args.status_every == 0:
                     print(_status(agent, report), file=sys.stderr)

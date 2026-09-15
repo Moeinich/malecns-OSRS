@@ -55,3 +55,8 @@ with open(path, "w") as f:
 PY
 
 echo "bot-env: $ENV_FILE ready"
+
+# The password, for callers that need it (the browser client logs in over HTTP).
+# `KEY=VALUE` on stdout is what flybrain/app.py folds into the child's env, so
+# this file stays the only reader of bot.env. Not echoed into any log.
+echo "RS_PASSWORD=$(grep -m1 '^PASSWORD=' "$ENV_FILE" | cut -d= -f2-)"
