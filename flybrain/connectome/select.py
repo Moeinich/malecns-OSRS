@@ -1,11 +1,21 @@
 """Subgraph selection over the full MaleCNS connectome.
 
-The whole graph is 152 M edges over 1.8 M bodies and does not fit the tick
-budget, so we cut it down. The cut is made by *connectivity*, not by hand: a
-neuron is kept when it is both reachable from the visual input population and
-able to influence a descending neuron. Anchors we depend on by name are then
-forced in regardless of score, because a network missing DNa02 is not a smaller
-model of the fly, it is a different one.
+The whole graph is 152 M edges over 1.8 M bodies. Over the *annotated* bodies
+at `min_syn=3` it is 10.7 M edges over 184,526 neurons, which does fit the tick
+budget, so the default is to keep all of it: `k=None` selects every connected
+annotated neuron and no PPR runs. Selecting everything is not a heuristic, and
+it is the only selection that cannot be wrong.
+
+A smaller `k` still cuts by *connectivity*, not by hand: a neuron is kept when
+it is both reachable from the visual input population and able to influence a
+descending neuron. Anchors we depend on by name are forced in regardless of
+score either way, because a network missing DNa02 is not a smaller model of the
+fly, it is a different one.
+
+Measured over the whole annotated graph, `min_syn` is not what starves the
+median neuron -- the net-inhibitory fraction is 32.5% at `min_syn=1` and 33.5%
+at `min_syn=5`, flat. The top-K cut was: it left the 55,599 kept neurons with
+1.73 M of their 6.30 M edges, median net input 3.0 against 15.0 whole-brain.
 """
 
 from __future__ import annotations
@@ -61,9 +71,10 @@ FORCED_TYPES = VISUAL_INPUT_TYPES + ON_RELAY_TYPES + MOTION_DETECTOR_TYPES + ANC
 
 @dataclass(frozen=True)
 class SelectionParams:
-    k: int = 20_000
-    min_syn: int = 5
-    max_edges: int = 3_000_000
+    #: `None` keeps every connected annotated neuron and skips the PPR score.
+    k: int | None = None
+    min_syn: int = 3
+    max_edges: int = 12_000_000
     max_min_syn: int = 64
     source_types: tuple[str, ...] = VISUAL_INPUT_TYPES
     anchor_types: tuple[str, ...] = FORCED_TYPES
@@ -232,6 +243,8 @@ def select(
     """Score by bidirectional PPR, force in the anchors, prune, keep the DN component."""
     params = params or SelectionParams()
     n = graph.shape[0]
+    connected = np.diff(graph.indptr) > 0
+    connected[graph.indices] = True
     descending = _rows_where(table, "superclass", params.anchor_superclasses)
     if descending.size == 0:
         raise ValueError(f"no rows in superclass {params.anchor_superclasses}")
@@ -241,12 +254,16 @@ def select(
     if sources.size == 0:
         raise ValueError(f"visual input types {params.source_types} resolved to nothing")
 
-    forward = _ppr(graph, _indicator(n, sources), params.ppr_alpha, params.ppr_iters)
-    backward = _ppr(graph.T.tocsr(), _indicator(n, descending), params.ppr_alpha, params.ppr_iters)
-    score = np.sqrt(forward * backward)
-
-    top = np.argsort(score, kind="stable")[::-1][: params.k]
-    top = top[score[top] > 0]
+    if params.k is None:
+        top = np.flatnonzero(connected)
+    else:
+        forward = _ppr(graph, _indicator(n, sources), params.ppr_alpha, params.ppr_iters)
+        backward = _ppr(
+            graph.T.tocsr(), _indicator(n, descending), params.ppr_alpha, params.ppr_iters
+        )
+        score = np.sqrt(forward * backward)
+        top = np.argsort(score, kind="stable")[::-1][: params.k]
+        top = top[score[top] > 0]
 
     anchors = [descending, _rows_where(table, "class", params.anchor_classes)]
     for name in params.anchor_types:
@@ -259,10 +276,10 @@ def select(
 
     kept = np.unique(np.concatenate([top, forced]))
     log.info(
-        "selected %d neurons: %d by score (top-%d), %d forced anchors",
+        "selected %d neurons: %d by %s, %d forced anchors",
         kept.size,
         top.size,
-        params.k,
+        "connectivity (no top-K cut)" if params.k is None else f"score (top-{params.k})",
         forced.size,
     )
 

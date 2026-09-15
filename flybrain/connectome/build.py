@@ -295,7 +295,12 @@ def _print_table(provenance: dict[str, object]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, default=ROOT / "data" / "cache" / "connectome_v1.npz")
-    parser.add_argument("--k", type=int, default=select_mod.SelectionParams.k)
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=select_mod.SelectionParams.k,
+        help="top-K PPR cut; omit to keep every connected annotated neuron",
+    )
     parser.add_argument("--min-syn", type=int, default=select_mod.SelectionParams.min_syn)
     parser.add_argument("--max-edges", type=int, default=select_mod.SelectionParams.max_edges)
     parser.add_argument("--unknown-nt", choices=sorted(UNKNOWN_SIGNS), default="excitatory")

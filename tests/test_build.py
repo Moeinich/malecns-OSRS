@@ -28,9 +28,9 @@ pytestmark = pytest.mark.skipif(
     reason="MaleCNS release not fetched; run tools/fetch_connectome.py",
 )
 
-#: The shipped K. A reduced K was here to keep the suite fast, but selection
-#: costs 0.5 s of a ~4 s build, so the saving bought nothing and the assertions
-#: below then held only for a network we do not run.
+#: The shipped K: `None`, the whole connected annotated graph. A reduced K was
+#: here to keep the suite fast, but the assertions below then held only for a
+#: network we do not run.
 BUILD_K = SelectionParams.k
 
 
@@ -259,13 +259,19 @@ def test_soma_positions_are_real_coordinates_for_most_of_the_selection(connectom
     The lamina is the hole: L1 carries a soma annotation for about a sixth of
     its cells. A zero fill would pile those thousands on the origin and draw as
     a dense structure that is not in the fly.
+
+    The bar was 0.85 when selection kept 55,599 neurons. The full brain is
+    76% covered, because it keeps all 89,403 ol_intrinsic cells and the release
+    annotates a soma for few of them. That is the release's coverage, not a
+    regression in this build -- the old bar measured which neurons the top-K
+    cut happened to drop.
     """
     pos = connectome.soma_positions
     assert pos.shape == (connectome.n, 3)
     assert pos.dtype == np.float32
 
     present = np.isfinite(pos).all(axis=1)
-    assert present.mean() > 0.85
+    assert present.mean() > 0.75
     assert np.isnan(pos[~present]).all(), "a missing soma must be NaN, not a coordinate"
     assert not (pos[present] == 0).all(axis=1).any()
 
