@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import tomllib
 from collections import defaultdict
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from flybrain.connectome import vocab
 
 log = logging.getLogger(__name__)
 
-CELL_TYPES_PATH = Path(__file__).resolve().parent / "cell_types.yaml"
+CELL_TYPES_PATH = Path(__file__).resolve().parent / "cell_types.toml"
 
 #: A bare prefix match would fold `Tm12` and `Tm16` into `Tm1`. A match is only
 #: an ambiguity of the same type when the remainder starts with a separator.
@@ -33,28 +34,8 @@ class MissingCellTypeError(LookupError):
 
 
 def _load_cell_types(path: Path = CELL_TYPES_PATH) -> dict[str, dict[str, object]]:
-    """Read the two-level `name: {key: scalar}` subset of YAML used by cell_types.yaml."""
-    spec: dict[str, dict[str, object]] = {}
-    current: dict[str, object] | None = None
-    for raw in path.read_text().splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line.strip():
-            continue
-        key, _, value = line.strip().partition(":")
-        value = value.strip()
-        if not raw.startswith(" "):
-            current = {}
-            spec[key] = current
-        elif current is None:
-            raise ValueError(f"{path}: indented line before any type: {raw!r}")
-        else:
-            if value in ("true", "false"):
-                current[key] = value == "true"
-            elif value.lstrip("-").isdigit():
-                current[key] = int(value)
-            else:
-                current[key] = value.strip("'\"")
-    return spec
+    with path.open("rb") as f:
+        return tomllib.load(f)
 
 
 class CellTypeRegistry:
@@ -151,7 +132,7 @@ class CellTypeRegistry:
         expected = spec.get("expect")
         if expected is not None and len(rows) != expected:
             log.warning(
-                "%s: implausible cardinality, expected %s from cell_types.yaml, found %d",
+                "%s: implausible cardinality, expected %s from cell_types.toml, found %d",
                 name,
                 expected,
                 len(rows),

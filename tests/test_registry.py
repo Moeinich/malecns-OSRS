@@ -7,7 +7,12 @@ import pytest
 from pyarrow import feather
 
 from flybrain.connectome import vocab
-from flybrain.connectome.registry import CellTypeRegistry, MissingCellTypeError
+from flybrain.connectome.registry import (
+    CELL_TYPES_PATH,
+    CellTypeRegistry,
+    MissingCellTypeError,
+    _load_cell_types,
+)
 
 pytestmark = pytest.mark.skipif(
     not vocab.DEFAULT_ANNOTATIONS_PATH.exists(),
@@ -77,3 +82,9 @@ def test_hex_lattice_yields_the_real_column_count(registry):
 
 def test_vocab_verify_passes_on_the_real_file(table):
     vocab.verify(table)
+
+
+def test_cell_types_toml_round_trips_required_cardinalities():
+    spec = _load_cell_types(CELL_TYPES_PATH)
+    required = {name: s["expect"] for name, s in spec.items() if s.get("required")}
+    assert required == {name: total for name, (total, _, _) in REQUIRED.items()}
