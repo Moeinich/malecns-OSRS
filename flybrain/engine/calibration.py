@@ -29,8 +29,13 @@ from typing import Any
 import numpy as np
 import scipy.sparse as sp
 
-from flybrain.connectome.loader import DEFAULT_PATH, Connectome
-from flybrain.engine.calibrate import Acceptance, RateSummary
+from flybrain.connectome.loader import (
+    DEFAULT_INCOMING_CAP,
+    DEFAULT_PATH,
+    Connectome,
+    normalize_incoming,
+)
+from flybrain.engine.calibrate import Acceptance, RateSummary, tonic_current
 
 DEFAULT_CALIBRATION_PATH = DEFAULT_PATH.with_name("calibration_v1.json")
 
@@ -78,6 +83,13 @@ class Calibration:
     gain: float
     spontaneous_noise_std: float | None = None
     i_max: float | None = None
+    #: Incoming-weight normalisation: `none`, `full` or `capped`. Not baked into
+    #: the `.npz` — the artifact says which mode the gain was measured under, and
+    #: `apply` reproduces it. `none` keeps an uncalibrated run on the raw matrix.
+    normalization: str = "none"
+    incoming_cap: float = DEFAULT_INCOMING_CAP
+    #: Tonic drive as a fraction of `v_thresh - v_rest`; `None` means no tonic.
+    tonic_fraction: float | None = None
     #: `LIFEngine`'s adaptation pair. `None` means "leave the engine's own default".
     b: float | None = None
     tau_w: float | None = None
@@ -95,11 +107,29 @@ class Calibration:
         return self.connectome is not None
 
     def apply(self, W: sp.csc_matrix) -> sp.csc_matrix:
-        """`W` scaled by the gain, as a new matrix. The input is never touched."""
+        """`W` normalised then scaled by the gain, as a new matrix.
+
+        The order is the one the search used: the gain is only meaningful on top
+        of the normalisation it was measured against. The input is never touched.
+        """
+        W = normalize_incoming(W, self.normalization, cap=self.incoming_cap)
         return sp.csc_matrix(
             (W.data.astype(np.float32) * np.float32(self.gain), W.indices, W.indptr),
             shape=W.shape,
         )
+
+    def tonic_drive(self, n: int) -> np.ndarray:
+        """The constant current to add to every injected drive vector.
+
+        The engine has no tonic parameter and `lif.py` is not ours to change, so
+        this is folded into the drive instead. For the exact-exponential update a
+        constant drive `I` pulls `v` to `v_rest + I`, so `tonic_fraction = 0.9`
+        asymptotes 10% short of threshold: a floor every neuron has, that the
+        connectome modulates around rather than gating on.
+        """
+        f = self.tonic_fraction
+        current = 0.0 if f is None else tonic_current(f)
+        return np.full(n, np.float32(current), dtype=np.float32)
 
     def engine_kwargs(self) -> dict[str, float]:
         """The `LIFEngine` arguments this calibration pins. Unset fields stay unset."""
@@ -123,7 +153,11 @@ class Calibration:
             return "UNCALIBRATED — gain 1.0, no band, no measured rate"
         lo, hi = (self.acceptance or Acceptance()).target_hz
         rate = f"{self.rates.mean_hz:.2f} Hz" if self.rates is not None else "n/a"
-        return f"gain {self.gain:.6g}  band {lo}-{hi} Hz  measured {rate}"
+        tonic = "none" if self.tonic_fraction is None else f"{self.tonic_fraction:.3g}"
+        return (
+            f"gain {self.gain:.6g}  band {lo}-{hi} Hz  measured {rate}  "
+            f"normalize {self.normalization}  tonic {tonic}"
+        )
 
     def save(self, path: Path | str = DEFAULT_CALIBRATION_PATH) -> Path:
         path = Path(path)
@@ -177,6 +211,9 @@ def _encode(c: Calibration) -> dict[str, Any]:
         "gain": c.gain,
         "spontaneous_noise_std": c.spontaneous_noise_std,
         "i_max": c.i_max,
+        "normalization": c.normalization,
+        "incoming_cap": c.incoming_cap,
+        "tonic_fraction": c.tonic_fraction,
         "b": c.b,
         "tau_w": c.tau_w,
         "acceptance": None if c.acceptance is None else _acceptance_json(c.acceptance),
@@ -197,6 +234,9 @@ def _decode(d: dict[str, Any]) -> Calibration:
         gain=float(d["gain"]),
         spontaneous_noise_std=d.get("spontaneous_noise_std"),
         i_max=d.get("i_max"),
+        normalization=d.get("normalization", "none"),
+        incoming_cap=float(d.get("incoming_cap", DEFAULT_INCOMING_CAP)),
+        tonic_fraction=d.get("tonic_fraction"),
         b=d.get("b"),
         tau_w=d.get("tau_w"),
         acceptance=None if acceptance is None else _acceptance_from(acceptance),

@@ -24,6 +24,50 @@ from flybrain.connectome.build import POPULATION_SEPARATOR
 
 DEFAULT_PATH = Path(__file__).resolve().parents[2] / "data" / "cache" / "connectome_v1.npz"
 
+NORMALIZATION_MODES = ("none", "full", "capped")
+
+#: Ceiling for `capped`, in summed |synapse count| of incoming weight. On the v1
+#: build incoming |weight| has median 231 and mean 571, so 500 leaves roughly the
+#: lower two thirds of the population at its own relative drive and pulls down
+#: only the hub tail, which runs to 119,578.
+DEFAULT_INCOMING_CAP = 500.0
+
+
+def normalize_incoming(
+    W: sp.csc_matrix, mode: str = "none", *, cap: float = DEFAULT_INCOMING_CAP
+) -> sp.csc_matrix:
+    """`W` with each neuron's total incoming |weight| bounded, as a new matrix.
+
+    Not baked into the `.npz`: raw synapse counts stay on disk and this is a
+    load-time choice, so the modes can be A/B'd against one build.
+
+    The stored matrix is `W[post, pre]`, so "incoming to neuron `j`" is *row* `j`
+    and the row index of every stored entry is `W.indices`. Bincounting the
+    columns instead would normalise by out-degree, which produces a
+    plausible-looking matrix that is wrong.
+
+    Scaling a whole row by one positive number leaves every E/I ratio inside that
+    row exactly where it was. What changes is that a single global gain then
+    means the same thing to a neuron with three inputs and to one with three
+    thousand, instead of 3.0 to one and 111.7 to the other.
+
+    `full` sends every row to 1.0. `capped` rescales only rows above `cap`
+    (`scale = cap / total`), leaving weakly-innervated cells their relative drive
+    rather than amplifying them to parity with the hubs.
+    """
+    if mode == "none":
+        return W
+    if mode not in NORMALIZATION_MODES:
+        raise ValueError(f"normalization mode {mode!r} is not one of {NORMALIZATION_MODES}")
+    data = W.data.astype(np.float32, copy=True)
+    incoming = np.bincount(W.indices, weights=np.abs(data), minlength=W.shape[0])
+    if mode == "full":
+        scale = 1.0 / np.maximum(incoming, 1.0)
+    else:
+        scale = np.minimum(1.0, cap / np.maximum(incoming, 1.0))
+    data *= scale[W.indices].astype(np.float32)
+    return sp.csc_matrix((data, W.indices.copy(), W.indptr.copy()), shape=W.shape)
+
 
 @dataclass(frozen=True)
 class Connectome:

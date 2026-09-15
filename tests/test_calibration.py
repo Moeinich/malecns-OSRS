@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -170,3 +171,48 @@ def test_a_run_without_an_artifact_says_so_and_runs_raw(tmp_path, monkeypatch, c
 
 class _Stub:
     dt_ms = 1.0
+
+
+def test_normalization_and_tonic_survive_the_round_trip(tmp_path):
+    c = replace(
+        _calibration(_connectome()),
+        normalization="capped",
+        incoming_cap=250.0,
+        tonic_fraction=0.9,
+    )
+    back = load_calibration(c.save(tmp_path / "calibration_v1.json"))
+
+    assert (back.normalization, back.incoming_cap, back.tonic_fraction) == (
+        "capped",
+        250.0,
+        0.9,
+    )
+    assert "normalize capped" in back.describe() and "tonic 0.9" in back.describe()
+    # Both are in the artifact by name, not implied by the gain.
+    stored = json.loads((tmp_path / "calibration_v1.json").read_text())
+    assert stored["normalization"] == "capped" and stored["tonic_fraction"] == 0.9
+
+
+def test_apply_normalizes_before_scaling_by_the_gain():
+    """The gain was measured on the normalised matrix; applying it to the raw one
+    would run a different network at a number that means nothing there."""
+    connectome = _connectome(n=6, scale=4.0)
+    c = replace(_calibration(connectome), gain=2.0, normalization="full")
+    W = c.apply(connectome.W)
+
+    np.testing.assert_allclose(np.abs(W).sum(axis=1).A1[:-1], 2.0, atol=1e-6)
+    np.testing.assert_array_equal(connectome.W.data, np.full(5, 4.0, dtype=np.float32))
+    # An artifact that predates the field keeps the raw matrix.
+    assert Calibration(gain=1.0).normalization == "none"
+    np.testing.assert_allclose(
+        Calibration(gain=2.0).apply(connectome.W).data, connectome.W.data * 2.0
+    )
+
+
+def test_tonic_drive_is_a_constant_short_of_threshold():
+    n = 6
+    assert np.count_nonzero(Calibration(gain=1.0).tonic_drive(n)) == 0
+
+    drive = Calibration(gain=1.0, tonic_fraction=0.9).tonic_drive(n)
+    assert drive.shape == (n,)
+    np.testing.assert_allclose(drive, 0.9 * 15.0)  # v_thresh - v_rest = 15 mV

@@ -45,6 +45,7 @@ from pathlib import Path
 import numpy as np
 import scipy.sparse as sp
 
+from flybrain.connectome.loader import DEFAULT_INCOMING_CAP, normalize_incoming
 from flybrain.engine.lif import LIFEngine
 
 #: Resting band for fly central neurons. At dt=1 ms, 5 Hz is 0.5% of neurons per
@@ -62,7 +63,55 @@ BIMODALITY_UNIFORM = 5.0 / 9.0
 #: the live brain — calibrating with noise and running without it makes the two
 #: different networks, and with a subthreshold input the noise is the only thing
 #: that ever initiates activity.
-DEFAULT_SPONTANEOUS_NOISE_STD = 0.5
+#:
+#: It was 0.5, and at 0.5 it initiates nothing. The noise enters `v` through the
+#: same `1 - exp(-dt/tau_m)` the drive does and is then low-passed by `tau_m`, so
+#: its standing deviation on the membrane is `std * sqrt((1-av)/(1+av))` = 0.158
+#: of the current figure: 0.079 mV against the 1.5 mV a 0.9 tonic leaves short of
+#: threshold, which is 19 sigma and never happens. Measured floor rate on an
+#: unconnected 2,000-cell net over 4 s, tonic 0.9:
+#:
+#:     std   0.5     1.0     2.0     4.0     8.0
+#:     Hz    0.00    0.00    0.00    1.01    3.71
+#:     silent 100%   100%    99.7%   0.1%    0.0%
+#:
+#: 4.0 is the first value that gives every neuron a floor, and it lands on
+#: ornata's ~1.2 Hz. Against an encoder peak of 6.0 (a 6 mV displacement) the
+#: noise contributes 0.63 mV, so the sensory signal is still 10x the jitter.
+DEFAULT_SPONTANEOUS_NOISE_STD = 4.0
+
+#: `LIFEngine`'s own resting and threshold potentials. Repeated here so a tonic
+#: can be expressed as a fraction of the distance between them rather than as a
+#: bare current that silently changes meaning if either constant moves.
+DEFAULT_V_REST = -65.0
+DEFAULT_V_THRESH = -50.0
+
+#: Tonic drive, as a fraction of `v_thresh - v_rest`.
+#:
+#: The engine's update is exact-exponential, so a constant drive `I` pulls `v` to
+#: the fixed point `v_rest + I`: at 0.9 every neuron asymptotes 10% short of
+#: threshold. Nothing fires from the tonic alone; what changes is that the
+#: connectome and the noise then modulate *around* a floor instead of deciding
+#: fire-versus-never, which is the failure mode adaptation could not touch —
+#: adaptation only subtracts, so it is a no-op on a cell already below threshold.
+DEFAULT_TONIC_FRACTION = 0.9
+
+#: Which incoming-weight normalisation the search runs by default.
+#:
+#: `capped`, not `full`, and the sweep is why. All three modes were run at tonic
+#: 0.9 over an 8,000-step window on the v1 build, gain 1.2 -> 3.5:
+#:
+#:     none    median 0.125 Hz, 48% silent, bimodal 0.51-0.56, at every gain
+#:     full    median 1.000 Hz,  0% silent, but log_slope 0.00 — gain does nothing
+#:     capped  median 1.875 -> 0.750 Hz, 12-40% silent, log_slope 0.60-1.12
+#:
+#: `full` fixes the silence and then throws the connectome away with it: bounding
+#: every row at 1.0 leaves a recurrent contribution too small to compete with the
+#: tonic, so the gain has no leverage and the brain is a noise generator with a
+#: graph attached. `capped` keeps both — swept down, it holds the 1-5 Hz band
+#: across gain 0.1 to 0.6, a 6x window where the old search had a cliff 0.06%
+#: of a gain wide.
+DEFAULT_NORMALIZATION = "capped"
 
 Drive = Callable[[int], np.ndarray]
 
@@ -260,6 +309,21 @@ def sensory_drive(
     return drive
 
 
+def tonic_current(
+    fraction: float, v_rest: float = DEFAULT_V_REST, v_thresh: float = DEFAULT_V_THRESH
+) -> float:
+    """The constant current that parks `v` at `fraction` of the way to threshold."""
+    return float(fraction) * (v_thresh - v_rest)
+
+
+def with_tonic(drive: Drive, n: int, tonic: float) -> Drive:
+    """`drive` plus a constant current into every neuron, including unwired ones."""
+    if not tonic:
+        return drive
+    base = np.full(n, np.float32(tonic), dtype=np.float32)
+    return lambda step: drive(step) + base
+
+
 def _as_drive(
     drive: Drive | np.ndarray | None,
     n: int,
@@ -345,6 +409,9 @@ def calibrate_gain(
     trim_thresholds: bool = False,
     trim_rounds: int = 3,
     noise_std: float = DEFAULT_SPONTANEOUS_NOISE_STD,
+    normalize: str = "none",
+    incoming_cap: float = DEFAULT_INCOMING_CAP,
+    tonic_fraction: float = 0.0,
     engine_kwargs: dict | None = None,
 ) -> CalibrationResult:
     """Bisect a scalar synaptic multiplier on the mean rate; accept on `Acceptance`.
@@ -352,11 +419,22 @@ def calibrate_gain(
     The mean is the search variable because it is the only scalar monotone in gain.
     It is *not* the acceptance test — a mean in band over a dead median is a failure,
     and it is returned as one, on `rejected` rather than `measurement`.
+
+    `normalize` and `tonic_fraction` are the two structural knobs. A scalar gain on
+    the raw matrix cannot work: per-neuron net input has median 3.0 and mean 111.7,
+    so one multiplier means a different thing to every cell. Normalising incoming
+    weight gives it one meaning; the tonic gives every cell a floor to modulate
+    around. Both are searched *with*, and both are carried on the artifact.
     """
     accept = acceptance or Acceptance(target_hz=target_hz)
     lo_band, hi_band = accept.target_hz
     n = W.shape[0]
-    drive_fn = _as_drive(drive, n, populations, injection_types, drive_amplitude)
+    W = normalize_incoming(W, normalize, cap=incoming_cap)
+    drive_fn = with_tonic(
+        _as_drive(drive, n, populations, injection_types, drive_amplitude),
+        n,
+        tonic_current(tonic_fraction) if tonic_fraction else 0.0,
+    )
     kw = {
         "dt_ms": dt_ms,
         "warmup_steps": warmup_steps,
@@ -539,7 +617,10 @@ def format_report(result: CalibrationResult) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from flybrain.connectome.loader import DEFAULT_PATH, load
+    from flybrain.connectome.loader import DEFAULT_PATH, NORMALIZATION_MODES, load
+
+    # Deferred: `calibration` imports this module, so the cycle only closes here.
+    from flybrain.engine.calibration import DEFAULT_CALIBRATION_PATH, Calibration, Fingerprint
 
     # Imported here, not at module scope: `flybrain.engine` has no business
     # depending on `flybrain.sensory`, but the injection layer has exactly one
@@ -549,6 +630,8 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--path", type=Path, default=DEFAULT_PATH)
     p.add_argument("--target", type=float, nargs=2, default=list(DEFAULT_TARGET_HZ))
+    # The band under the default normalisation and tonic sits near 0.4; 1e-3 to
+    # 10 brackets it with room on both sides.
     p.add_argument("--gain-range", type=float, nargs=2, default=[1e-3, 10.0])
     p.add_argument("--max-iter", type=int, default=14)
     p.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
@@ -556,7 +639,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--amplitude", type=float, default=EncodeParams().i_max)
     p.add_argument("--active-fraction", type=float, default=0.01)
     p.add_argument("--noise-std", type=float, default=DEFAULT_SPONTANEOUS_NOISE_STD)
+    p.add_argument("--normalize", choices=NORMALIZATION_MODES, default=DEFAULT_NORMALIZATION)
+    p.add_argument("--incoming-cap", type=float, default=DEFAULT_INCOMING_CAP)
+    p.add_argument("--tonic-fraction", type=float, default=DEFAULT_TONIC_FRACTION)
     p.add_argument("--trim-thresholds", action="store_true")
+    p.add_argument(
+        "--save",
+        nargs="?",
+        const=str(DEFAULT_CALIBRATION_PATH),
+        default=None,
+        help="write the accepted calibration here so the live brain picks it up",
+    )
     args = p.parse_args(argv)
 
     connectome = load(args.path)
@@ -577,10 +670,36 @@ def main(argv: list[str] | None = None) -> int:
         warmup_steps=args.warmup_steps,
         measure_steps=args.measure_steps,
         noise_std=args.noise_std,
+        normalize=args.normalize,
+        incoming_cap=args.incoming_cap,
+        tonic_fraction=args.tonic_fraction,
         trim_thresholds=args.trim_thresholds,
     )
     print(f"connectome       {args.path}  N={connectome.n}  nnz={connectome.W.nnz}")
+    print(f"normalize        {args.normalize}  cap {args.incoming_cap:g}")
+    print(
+        f"tonic            {args.tonic_fraction:g} of threshold distance "
+        f"= {tonic_current(args.tonic_fraction):.3f}  noise_std {args.noise_std:g}"
+    )
     print(format_report(result))
+    if args.save and result.success:
+        path = Calibration(
+            gain=result.gain,
+            spontaneous_noise_std=args.noise_std,
+            i_max=args.amplitude,
+            normalization=args.normalize,
+            incoming_cap=args.incoming_cap,
+            tonic_fraction=args.tonic_fraction or None,
+            acceptance=Acceptance(target_hz=tuple(args.target)),
+            rates=result.measurement.rates,
+            measure_steps=args.measure_steps,
+            drive=(
+                f"sensory_drive over {'/'.join(LUMINANCE_TYPES)}, amplitude {args.amplitude:g}, "
+                f"active_fraction {args.active_fraction:g}, tonic {args.tonic_fraction:g}"
+            ),
+            connectome=Fingerprint.of(connectome),
+        ).save(args.save)
+        print(f"saved            {path}")
     return 0 if result.success else 1
 
 

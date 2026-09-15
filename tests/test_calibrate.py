@@ -6,8 +6,12 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
+from flybrain.connectome.loader import normalize_incoming
 from flybrain.engine.calibrate import (
     BIMODALITY_UNIFORM,
+    DEFAULT_TONIC_FRACTION,
+    DEFAULT_V_REST,
+    DEFAULT_V_THRESH,
     FRAME_STEPS,
     SATURATION_FRACTION,
     SUBFRAMES_PER_TICK,
@@ -18,7 +22,10 @@ from flybrain.engine.calibrate import (
     measure_gain,
     sensory_drive,
     summarize_rates,
+    tonic_current,
+    with_tonic,
 )
+from flybrain.engine.lif import LIFEngine
 
 FAST = {"warmup_steps": 200, "measure_steps": 400}
 #: A 400-step window quantizes rates to 2.5 Hz, so at a 1-5 Hz mean almost every
@@ -117,7 +124,11 @@ def test_bistable_network_is_reported_as_failed_not_as_a_near_miss():
     W = _bistable_net(n)
     drive = _drive(n, background=14.0, sensory=10, active_fraction=0.1)
 
-    result = calibrate_gain(W, drive=drive, gain_range=(1e-5, 10.0), max_iter=12, **FAST)
+    # Pinned: this fixture sits 1 mV below threshold, so the default membrane
+    # noise now fires it on its own and there is no quiet bracket to find.
+    result = calibrate_gain(
+        W, drive=drive, gain_range=(1e-5, 10.0), max_iter=12, noise_std=0.5, **FAST
+    )
 
     assert not result.success
     assert result.measurement is None
@@ -237,3 +248,78 @@ def test_threshold_trim_moves_an_over_firing_population():
     assert offsets.shape == (n,)
     # The driven population is the one firing hardest, so its threshold rises.
     assert offsets[:50].mean() > offsets[50:].mean()
+
+
+def _asymmetric_net(n: int = 200, seed: int = 3):
+    """Wildly uneven in-degree: a few hubs, most cells with a handful of inputs."""
+    rng = np.random.default_rng(seed)
+    M = np.zeros((n, n), dtype=np.float32)
+    for post in range(n):
+        k = 3 if post % 4 else 120
+        pre = rng.choice(n, k, replace=False)
+        M[post, pre] = rng.integers(1, 40, k)
+    np.fill_diagonal(M, 0.0)
+    sign = np.where(rng.random(n) < 0.3, -1.0, 1.0).astype(np.float32)
+    return sp.csc_matrix(M * sign[None, :])
+
+
+def test_normalization_bounds_every_row_and_leaves_the_e_i_ratio_alone():
+    """Row, not column: `W` is `W[post, pre]`, so incoming is `W.indices`."""
+    W = _asymmetric_net()
+    rows = np.abs(W).sum(axis=1).A1
+    assert rows.max() / rows[rows > 0].min() > 50  # the imbalance being removed
+
+    full = normalize_incoming(W, "full")
+    np.testing.assert_allclose(np.abs(full).sum(axis=1).A1, 1.0, atol=1e-6)
+
+    dense, scaled = W.toarray(), full.toarray()
+    pos, neg = dense.clip(min=0).sum(axis=1), -dense.clip(max=0).sum(axis=1)
+    spos, sneg = scaled.clip(min=0).sum(axis=1), -scaled.clip(max=0).sum(axis=1)
+    np.testing.assert_allclose(spos, pos / rows, atol=1e-6)
+    np.testing.assert_allclose(sneg, neg / rows, atol=1e-6)
+    np.testing.assert_array_equal(np.sign(scaled), np.sign(dense))
+
+
+def test_capped_normalization_only_touches_the_over_innervated():
+    W = _asymmetric_net()
+    rows = np.abs(W).sum(axis=1).A1
+    cap = float(np.median(rows))
+    capped = np.abs(normalize_incoming(W, "capped", cap=cap)).sum(axis=1).A1
+
+    under = rows <= cap
+    np.testing.assert_allclose(capped[under], rows[under], rtol=1e-5)
+    np.testing.assert_allclose(capped[~under], cap, rtol=1e-5)
+    assert normalize_incoming(W, "none") is W
+    with pytest.raises(ValueError, match="not one of"):
+        normalize_incoming(W, "by-column")
+
+
+def test_normalizing_the_columns_instead_would_have_looked_fine():
+    """The axis that fails silently: out-degree normalisation also 'sums to 1'."""
+    W = _asymmetric_net()
+    out_degree = np.abs(W).sum(axis=0).A1
+    assert not np.allclose(out_degree, np.abs(W).sum(axis=1).A1)
+    assert not np.allclose(np.abs(normalize_incoming(W, "full")).sum(axis=0).A1, 1.0)
+
+
+def test_tonic_parks_the_membrane_just_below_threshold():
+    """The fixed point of the exact-exponential update under a constant drive."""
+    v_rest, v_thresh = DEFAULT_V_REST, DEFAULT_V_THRESH
+    assert tonic_current(0.9) == pytest.approx(0.9 * (v_thresh - v_rest))
+
+    engine = LIFEngine(sp.csc_matrix((4, 4), dtype=np.float32), spontaneous_noise_std=0.0)
+    current = np.full(4, np.float32(tonic_current(DEFAULT_TONIC_FRACTION)), dtype=np.float32)
+    for _ in range(400):
+        assert engine.step(current).size == 0
+    np.testing.assert_allclose(engine.v, v_rest + tonic_current(DEFAULT_TONIC_FRACTION), atol=1e-3)
+    # A hair more and the same silent neuron fires: the floor is the whole point.
+    hot = LIFEngine(sp.csc_matrix((4, 4), dtype=np.float32), spontaneous_noise_std=0.0)
+    over = np.full(4, np.float32(tonic_current(1.01)), dtype=np.float32)
+    assert any(hot.step(over).size for _ in range(400))
+
+
+def test_with_tonic_lifts_every_neuron_including_the_undriven():
+    base = sensory_drive(10, np.arange(3), amplitude=5.0, active_fraction=1.0)
+    lifted = with_tonic(base, 10, 2.0)
+    np.testing.assert_allclose(lifted(0), base(0) + 2.0)
+    assert with_tonic(base, 10, 0.0) is base
