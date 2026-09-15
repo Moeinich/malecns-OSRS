@@ -509,7 +509,7 @@ def test_the_report_states_every_expectation_and_the_tickrate():
     ):
         assert expectation in text
     assert "HELD" in text
-    assert "overruns its tick" in text
+    assert "No overrun was measured this run" in text
 
 
 def test_the_json_report_is_serialisable_and_carries_the_verdict():
@@ -610,3 +610,53 @@ def test_an_unmeasured_tick_falls_back_to_the_configured_one_without_a_mismatch(
 def test_compute_time_is_measured_per_episode_not_only_as_an_overrun_flag():
     m = metrics(episode([record(tick=i, ms_total=100.0 + i) for i in range(4)]))
     assert m["mean_ms_per_tick"] == pytest.approx(101.5)
+
+
+# ------------------------------------------------------------------- caveats
+
+
+def timed(ms: float, overrun: float, kills: float = 0.0) -> list[dict[str, float]]:
+    return [
+        {"mean_ms_per_tick": ms, "overrun_fraction": overrun, "kills_per_hr": kills}
+        for _ in range(4)
+    ]
+
+
+def test_the_overrun_caveat_is_measured_from_the_run_not_hardcoded():
+    per_condition = {"real": timed(94.6, 0.733), "shuffle": timed(99.0, 1.0)}
+    text = report(per_condition, effects(per_condition, seed=0, reps=200), meta(tick_ms=150))
+    assert "94.6 ms / 0.733" in text
+    assert "99.0 ms / 1" in text
+    assert "90 ms deadline" in text
+    assert "LIVE CONFOUND" in text.upper()
+    assert "shuffle (1)" in text and "real (0.733)" in text
+    assert "not a live confound" not in text
+    assert "applies equally" not in text
+
+
+def test_a_run_that_meets_its_deadline_says_staleness_was_not_a_confound():
+    per_condition = {"real": timed(40.0, 0.0), "shuffle": timed(41.0, 0.0)}
+    text = report(per_condition, effects(per_condition, seed=0, reps=200), meta(tick_ms=200))
+    assert "staleness was not a live confound in THIS run" in text
+    assert "120 ms deadline" in text
+    assert "IS a live confound" not in text
+    assert "applies equally" not in text
+
+
+def test_the_derived_caveats_are_identical_in_the_text_and_json_reports():
+    per_condition = {"real": timed(94.6, 0.733), "shuffle": timed(99.0, 1.0)}
+    computed = effects(per_condition, seed=0, reps=200)
+    m = meta(tick_ms=150)
+    for caveat in to_json(per_condition, computed, m)["caveats"]:
+        assert caveat in report(per_condition, computed, m)
+
+
+def test_the_zero_kills_clause_is_conditional_on_the_measured_kills():
+    m = meta(tick_ms=150)
+    quiet = {"real": timed(40.0, 0.0), "shuffle": timed(40.0, 0.0)}
+    assert "Zero kills in every condition" in report(quiet, effects(quiet, seed=0, reps=200), m)
+
+    killing = {"real": timed(40.0, 0.0, kills=12.0), "shuffle": timed(40.0, 0.0)}
+    text = report(killing, effects(killing, seed=0, reps=200), m)
+    assert "Zero kills in every condition" not in text
+    assert "real 12/hr" in text

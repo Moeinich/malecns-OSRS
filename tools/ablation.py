@@ -78,25 +78,12 @@ SCALAR_METRICS = (
     "mean_ms_per_tick",
 )
 
-#: Recorded in every report rather than papered over. Both are live as of writing.
-CAVEATS = (
-    (
-        "The brain overruns its tick (84-111 ms of work against a 90 ms deadline at "
-        "NODE_TICKRATE=150) and the encoder drive goes stale on the ticks it does. Overrun is "
-        "NOT equal across conditions: the cost of a step is edges touched = N x firing rate x "
-        "degree, so a hotter condition overruns more. Measured overrun_fraction: real 0.258, "
-        "lesion:DNa02 0.451, lesion:optic 0.0005, ablate-network 0.001, shuffle 1.000. Staleness "
-        "is therefore a LIVE CONFOUND on any contrast between conditions of unequal firing rate "
-        "— shuffle fires 64% hotter than real and missed every deadline. `overrun_fraction` and "
-        "`mean_ms_per_tick` are per condition."
-    ),
-    (
-        "The decoded drive sits near 0.10 with a steering differential of about +/-0.1 rad, so "
-        "directed movement is slow and the steering metrics (distance, tortuosity) are "
-        "correspondingly noisy. Zero kills in every condition is a result about the decoder's "
-        "dynamic range, not a broken harness."
-    ),
-)
+#: The sidecar's `deadlineFraction`. Source of truth is bridge/config.ts — restated
+#: rather than imported, so a drift there is findable from here.
+DEADLINE_FRACTION = 0.6
+
+#: An overrun fraction at or below this is not a material confound.
+NEGLIGIBLE_OVERRUN = 0.01
 
 SHUFFLE_DEGRADED = (
     "SHUFFLE DEGRADED vs real: the connectome's specific wiring does work beyond its degree "
@@ -635,6 +622,81 @@ def _tick_mismatch(meta: RunMeta) -> list[str]:
     ]
 
 
+def caveats(per_condition: dict[str, list[dict[str, float]]], meta: RunMeta) -> tuple[str, ...]:
+    """Recorded in every report, derived from the run they are attached to.
+
+    A caveat quoting numbers from some earlier run reads authoritative and
+    describes a run that is not this one, so every figure here is measured.
+    """
+    return (_overrun_caveat(per_condition, meta), _decoder_caveat(per_condition))
+
+
+def _overrun_caveat(per_condition: dict[str, list[dict[str, float]]], meta: RunMeta) -> str:
+    deadline = round(meta.tick_ms * DEADLINE_FRACTION)
+    measured = [
+        (condition, _mean(_column(runs, "mean_ms_per_tick")), fraction)
+        for condition, runs in per_condition.items()
+        if math.isfinite(fraction := _mean(_column(runs, "overrun_fraction")))
+    ]
+    head = (
+        f"The brain's step runs against a {deadline} ms deadline ({DEADLINE_FRACTION:g} of the "
+        f"{meta.tick_ms} ms tick) and the encoder drive goes stale on any tick it overruns. "
+    )
+    if not measured:
+        return head + "No overrun was measured this run, so nothing can be said about staleness."
+    detail = ", ".join(f"{c} {ms:.1f} ms / {f:.3g}" for c, ms, f in measured)
+    mechanism = (
+        "The cost of a step is edges touched = N x firing rate x degree, so a hotter condition "
+        "costs more; overrun is then a STEP function of that cost against the deadline, so "
+        "conditions clustered near it can show wildly different overrun fractions for a few ms "
+        "of difference. Measured this run (mean_ms_per_tick / overrun_fraction): " + detail + ". "
+    )
+    overrunning = [(c, f) for c, _, f in measured if f > NEGLIGIBLE_OVERRUN]
+    if not overrunning:
+        worst = max(measured, key=lambda row: row[2])
+        return (
+            head
+            + mechanism
+            + (
+                f"No condition overran materially this run (the worst, {worst[0]}, at "
+                f"{worst[2]:.3g}), so staleness was not a live confound in THIS run."
+            )
+        )
+    named = ", ".join(f"{c} ({f:.3g})" for c, f in overrunning)
+    return (
+        head
+        + mechanism
+        + (
+            f"Staleness IS a live confound on any contrast involving {named}: those conditions ran "
+            f"stale drive on that fraction of their ticks, and the conditions they are measured "
+            f"against did not do so to the same degree."
+        )
+    )
+
+
+def _decoder_caveat(per_condition: dict[str, list[dict[str, float]]]) -> str:
+    head = (
+        "The decoded drive sits near 0.10 with a steering differential of about +/-0.1 rad, so "
+        "directed movement is slow and the steering metrics (distance, tortuosity) are "
+        "correspondingly noisy. "
+    )
+    killing = [
+        (condition, kills)
+        for condition, runs in per_condition.items()
+        if math.isfinite(kills := _mean(_column(runs, "kills_per_hr"))) and kills > 0
+    ]
+    if killing:
+        return (
+            head
+            + "Kills were not zero in every condition this run: "
+            + ", ".join(f"{c} {k:.3g}/hr" for c, k in killing)
+        )
+    return head + (
+        "Zero kills in every condition is a result about the decoder's dynamic range, not a "
+        "broken harness."
+    )
+
+
 def report(
     per_condition: dict[str, list[dict[str, float]]],
     effects_by_condition: dict[str, dict[str, Effect]],
@@ -693,7 +755,7 @@ def report(
         "",
         "-- caveats " + "-" * 67,
     ]
-    lines += [f"  - {c}" for c in CAVEATS]
+    lines += [f"  - {c}" for c in caveats(per_condition, meta)]
     return "\n".join(lines) + "\n"
 
 
@@ -705,7 +767,7 @@ def to_json(
     return _jsonable(
         {
             "meta": vars(meta),
-            "caveats": list(CAVEATS),
+            "caveats": list(caveats(per_condition, meta)),
             "episodes": per_condition,
             "effects": {
                 condition: {metric: vars(e) for metric, e in by_metric.items()}
@@ -731,7 +793,7 @@ def partial_json(per_condition: dict[str, list[dict[str, float]]], meta: RunMeta
     return _jsonable(
         {
             "meta": vars(meta),
-            "caveats": list(CAVEATS),
+            "caveats": list(caveats(per_condition, meta)),
             "episodes": per_condition,
             "partial": True,
         }
