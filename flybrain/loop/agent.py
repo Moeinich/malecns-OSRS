@@ -1,0 +1,356 @@
+"""The tick loop: state in, sub-frames, LIF substeps, decoded action out.
+
+One game tick is rendered as four sub-frames; each is encoded to an injection
+current that is then held constant for `substeps_per_subframe` LIF steps. At
+the end of the tick the descending-neuron firing rates are decoded and the
+body turns the egocentric command into an action.
+
+Nothing here computes behaviour. Every value that reaches `to_action` came out
+of `decode`, and everything `decode` saw came out of the simulated network — so
+the ablations below are a real test of whether the wiring does any work.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+
+import numpy as np
+import scipy.sparse as sp
+
+from flybrain.connectome.loader import Connectome
+from flybrain.engine.lif import LIFEngine
+from flybrain.loop.client import BridgeClient
+from flybrain.loop.types import Action, StateUpdate
+from flybrain.motor.body import BodyParams, to_action
+from flybrain.motor.decode import EgocentricCommand, MotorIndex, decode
+from flybrain.sensory.collision import CollisionGrid
+from flybrain.sensory.heading import Heading
+from flybrain.sensory.retina import Retina
+
+#: `float32[size, size, 4]` sub-frame -> `float32[N]` injection current.
+Encoder = Callable[[np.ndarray], np.ndarray]
+
+
+@dataclass(frozen=True)
+class AgentParams:
+    subframes: int = 4
+    #: 4 x 100 substeps at dt = 1 ms covers a 400 ms game tick.
+    substeps_per_subframe: int = 100
+    rate_window_steps: int | None = None
+    #: Fraction of the sidecar's stated deadline we are willing to spend.
+    deadline_fraction: float = 1.0
+    dry_run: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TickReport:
+    revision: int
+    tick: int
+    heading: float
+    command: EgocentricCommand
+    action: Action
+    mean_rate_hz: float
+    ms_total: float
+    ms_retina: float
+    ms_encode: float
+    ms_lif: float
+    ms_decode: float
+    substeps: int
+    overrun: bool
+    dropped_game_ticks: int
+
+    @property
+    def kind(self) -> str:
+        return self.action.kind
+
+
+def default_encoder(connectome: Connectome, params: object | None = None) -> Encoder:
+    """The real encoder, bound to one connectome. Needs the annotations feather."""
+    from flybrain.sensory.encode import EncodeParams, encode
+
+    bound = params if params is not None else EncodeParams()
+    return lambda frame: encode(frame, connectome, bound)
+
+
+class Agent:
+    def __init__(
+        self,
+        client: BridgeClient,
+        engine: LIFEngine,
+        motor: MotorIndex,
+        collision: CollisionGrid,
+        encoder: Encoder,
+        *,
+        retina: Retina | None = None,
+        heading: Heading | None = None,
+        params: AgentParams | None = None,
+        body_params: BodyParams | None = None,
+    ) -> None:
+        self.client = client
+        self.engine = engine
+        self.motor = motor
+        self.collision = collision
+        self.encoder = encoder
+        self.retina = retina if retina is not None else Retina()
+        self.heading = heading if heading is not None else Heading()
+        self.params = params if params is not None else AgentParams()
+        self.body_params = body_params
+
+        self.ticks = 0
+        self.overruns = 0
+        self.last: TickReport | None = None
+        self.action_counts: dict[str, int] = {}
+        self._ms_total = 0.0
+        self._ms_lif = 0.0
+        self._prev_state = None
+        self._prev_heading: float | None = None
+
+    # ------------------------------------------------------------------ loop
+
+    def run(self, max_ticks: int | None = None) -> Iterator[TickReport]:
+        for update in self.client.states():
+            yield self.tick(update)
+            if max_ticks is not None and self.ticks >= max_ticks:
+                return
+
+    def tick(self, update: StateUpdate) -> TickReport:
+        p = self.params
+        t0 = time.perf_counter()
+        budget = update.deadline_ms / 1000.0 * p.deadline_fraction
+
+        state = update.state
+        heading = self.heading.update(state)
+
+        frames = self.retina.render_subframes(
+            self._prev_state,
+            state,
+            self.collision,
+            heading,
+            n=p.subframes,
+            prev_heading=self._prev_heading,
+        )
+        t_retina = time.perf_counter()
+
+        ms_encode = 0.0
+        ms_lif = 0.0
+        substeps = 0
+        overrun = False
+        for frame in frames:
+            a = time.perf_counter()
+            current = self.encoder(frame)
+            b = time.perf_counter()
+            for _ in range(p.substeps_per_subframe):
+                self.engine.step(current)
+            c = time.perf_counter()
+            ms_encode += (b - a) * 1e3
+            ms_lif += (c - b) * 1e3
+            substeps += p.substeps_per_subframe
+            # Send what we have rather than stall the gateway: a late command is
+            # worse than a coarse one, because the sidecar will dispatch the
+            # continuation policy and our revision goes stale.
+            if c - t0 > budget:
+                overrun = True
+                break
+
+        t_decode = time.perf_counter()
+        rates = self.engine.get_firing_rates(p.rate_window_steps)
+        command = decode(rates, self.motor)
+        action = to_action(command, state, heading, self.body_params)
+        t_end = time.perf_counter()
+
+        if p.dry_run:
+            self.client.send_noop(update.revision)
+        else:
+            self.client.send_cmd(update.revision, action)
+
+        self._prev_state = state
+        self._prev_heading = heading
+        self.ticks += 1
+        if overrun:
+            self.overruns += 1
+        self.action_counts[action.kind] = self.action_counts.get(action.kind, 0) + 1
+
+        report = TickReport(
+            revision=update.revision,
+            tick=update.tick,
+            heading=heading,
+            command=command,
+            action=action,
+            mean_rate_hz=float(rates.mean()),
+            ms_total=(t_end - t0) * 1e3,
+            ms_retina=(t_retina - t0) * 1e3,
+            ms_encode=ms_encode,
+            ms_lif=ms_lif,
+            ms_decode=(t_end - t_decode) * 1e3,
+            substeps=substeps,
+            overrun=overrun,
+            dropped_game_ticks=self.client.dropped_game_ticks,
+        )
+        self._ms_total += report.ms_total
+        self._ms_lif += report.ms_lif
+        self.last = report
+        return report
+
+    # --------------------------------------------------------------- health
+
+    @property
+    def mean_ms_per_tick(self) -> float:
+        return self._ms_total / self.ticks if self.ticks else 0.0
+
+    @property
+    def mean_ms_lif(self) -> float:
+        return self._ms_lif / self.ticks if self.ticks else 0.0
+
+
+# --------------------------------------------------------------- ablations
+#
+# Every one of these returns a new matrix. The cached .npz on disk and the
+# connectome's own `W` are never touched: a lesion that outlived the process
+# would quietly poison every later run.
+
+
+@dataclass(frozen=True)
+class Ablation:
+    lesions: tuple[str, ...] = ()
+    ablate_network: bool = False
+    shuffle: bool = False
+    seed: int = 0
+    #: Filled in by `apply`, so the run summary can state what actually happened.
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        parts = []
+        if self.ablate_network:
+            parts.append("ablate-network")
+        if self.shuffle:
+            parts.append(f"shuffle(seed={self.seed})")
+        parts += [f"lesion:{name}" for name in self.lesions]
+        return "+".join(parts) if parts else "real"
+
+    def apply(self, connectome: Connectome) -> sp.csc_matrix:
+        W = connectome.W.copy()
+        if self.ablate_network:
+            W = ablate_network(W)
+            self.notes.append(f"zeroed all {connectome.W.nnz} synapses")
+        if self.shuffle:
+            W, conflicts = shuffle_degree_preserving(W, self.seed)
+            self.notes.append(f"degree-preserving rewire, {conflicts} unresolved conflicts")
+        for name in self.lesions:
+            idx = _population(connectome, name)
+            W = lesion(W, idx)
+            self.notes.append(f"lesion {name}: silenced {len(idx)} neurons")
+        return W
+
+
+def _population(connectome: Connectome, name: str) -> np.ndarray:
+    try:
+        return connectome.population(name)
+    except KeyError:
+        available = ", ".join(sorted(connectome.populations))
+        raise KeyError(f"no population {name!r} in this build; have: {available}") from None
+
+
+def lesion(W: sp.csc_matrix, idx: np.ndarray) -> sp.csc_matrix:
+    """Silence a population: zero both its outgoing and its incoming weights.
+
+    Outgoing alone would not be a lesion for any population we read out of. The
+    decoder measures DNp01's *firing rate*, which is driven by what DNp01
+    receives, so cutting only its axons would leave escape fully intact and the
+    double dissociation would be untestable. Cutting both is what removing the
+    cells actually does.
+    """
+    W = W.tocsc(copy=True)
+    idx = np.asarray(idx, dtype=np.int64)
+    if idx.size == 0:
+        return W
+    column_of = np.repeat(np.arange(W.shape[1]), np.diff(W.indptr))
+    mask = np.isin(column_of, idx) | np.isin(W.indices, idx)
+    W.data[mask] = 0.0
+    return W
+
+
+def ablate_network(W: sp.csc_matrix) -> sp.csc_matrix:
+    """Every synapse to zero, structure kept. Encoder and decoder stay intact."""
+    W = W.tocsc(copy=True)
+    W.data[:] = 0.0
+    return W
+
+
+def shuffle_degree_preserving(W: sp.csc_matrix, seed: int = 0) -> tuple[sp.csc_matrix, int]:
+    """Rewire at random, preserving in-degree, out-degree and transmitter sign.
+
+    The column of a CSC matrix is the presynaptic neuron, so permuting the
+    postsynaptic index array globally leaves every column's length (out-degree)
+    untouched and the multiset of targets (in-degree) unchanged, while the
+    weights — and therefore Dale's-law sign, which is per presynaptic neuron —
+    stay with the column they came from.
+
+    This is the control that matters: if a shuffled connectome plays as well as
+    the real one, the specific wiring contributes nothing.
+    """
+    W = W.tocsc(copy=True)
+    rng = np.random.default_rng(seed)
+    indptr = W.indptr
+    indices = W.indices[rng.permutation(W.nnz)].astype(np.int64, copy=False)
+    column_of = np.repeat(np.arange(W.shape[1], dtype=np.int64), np.diff(indptr))
+
+    conflicts = _repair(indices, column_of, rng, W.shape[1])
+    _sort_columns(indices, W.data, indptr)
+    return sp.csc_matrix(
+        (W.data, indices.astype(W.indices.dtype), indptr), shape=W.shape
+    ), conflicts
+
+
+def _conflicting(indices: np.ndarray, column_of: np.ndarray, n: int) -> np.ndarray:
+    """Positions holding a self-loop or a second copy of an edge already present."""
+    self_loops = indices == column_of
+    key = column_of * n + indices
+    order = np.argsort(key, kind="stable")
+    duplicate = np.zeros(indices.size, dtype=bool)
+    sorted_key = key[order]
+    duplicate[order[1:]] = sorted_key[1:] == sorted_key[:-1]
+    return np.flatnonzero(self_loops | duplicate)
+
+
+def _repair(indices: np.ndarray, column_of: np.ndarray, rng, n: int, rounds: int = 64) -> int:
+    """Swap the bad targets against random other positions until they are legal."""
+    for _ in range(rounds):
+        bad = _conflicting(indices, column_of, n)
+        if bad.size == 0:
+            return 0
+        # Both sides of the swap must be unique and disjoint, or numpy's
+        # last-write-wins would drop a target and silently change an in-degree.
+        partner = np.unique(rng.integers(0, indices.size, size=bad.size))
+        partner = partner[~np.isin(partner, bad)]
+        k = min(partner.size, bad.size)
+        left, right = bad[:k], partner[:k]
+        held = indices[left].copy()
+        indices[left] = indices[right]
+        indices[right] = held
+    return int(_conflicting(indices, column_of, n).size)
+
+
+def _sort_columns(indices: np.ndarray, data: np.ndarray, indptr: np.ndarray) -> None:
+    """Canonical order per column, weights carried along so no edge changes sign."""
+    for j in range(len(indptr) - 1):
+        lo, hi = indptr[j], indptr[j + 1]
+        if hi - lo > 1:
+            order = np.argsort(indices[lo:hi], kind="stable")
+            indices[lo:hi] = indices[lo:hi][order]
+            data[lo:hi] = data[lo:hi][order]
+
+
+__all__ = [
+    "Ablation",
+    "Agent",
+    "AgentParams",
+    "Encoder",
+    "TickReport",
+    "ablate_network",
+    "default_encoder",
+    "lesion",
+    "shuffle_degree_preserving",
+]

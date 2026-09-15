@@ -24,6 +24,7 @@ packages = ["flybrain"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["slow: needs the real connectome artifact or a long run"]
 
 [tool.ruff]
 line-length = 100
