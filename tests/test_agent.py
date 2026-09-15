@@ -66,13 +66,16 @@ def _npc(index: int, x: int, z: int, level: int = 20) -> dict:
     }
 
 
-def state_msg(revision: int, x: int, z: int, npcs=(), items=(), deadline_ms: int = 360) -> dict:
+def state_msg(revision: int, x: int, z: int, npcs=(), items=(), tick_ms: int = 600) -> dict:
+    """Deadline and tick come from one value: the sidecar derives one from the other."""
     return {
         "t": "state",
         "revision": revision,
         "tick": 88000 + revision,
         "droppedSinceLast": 0,
-        "deadlineMs": deadline_ms,
+        "deadlineMs": round(tick_ms * 0.6),
+        "tickMs": tick_ms,
+        "observedTickMs": None,
         "state": {
             "tick": 88000 + revision,
             "inGame": True,
@@ -221,7 +224,7 @@ def _collision() -> CollisionGrid:
     return CollisionGrid(grid=grid, x_min=3200, z_min=3200, level=0)
 
 
-def _script(n_ticks: int) -> list[dict]:
+def _script(n_ticks: int, tick_ms: int = 600) -> list[dict]:
     """The player drifts east; a rat closes in from tick 3, loot drops at tick 6."""
     out = []
     for k in range(n_ticks):
@@ -242,7 +245,7 @@ def _script(n_ticks: int) -> list[dict]:
             if k >= 6
             else []
         )
-        out.append(state_msg(k + 1, x, z, npcs, items))
+        out.append(state_msg(k + 1, x, z, npcs, items, tick_ms=tick_ms))
     return out
 
 
@@ -260,12 +263,19 @@ def _agent(sidecar: FakeSidecar, W: sp.csc_matrix, **params) -> Agent:
     )
 
 
-def run_condition(ablation: Ablation | None, n_ticks: int = 12, tick_ms: int = 600, **params):
+def run_condition(
+    ablation: Ablation | None,
+    n_ticks: int = 12,
+    tick_ms: int = 600,
+    state_tick_ms: int | None = None,
+    **params,
+):
     connectome = _connectome()
     W = ablation.apply(connectome) if ablation is not None else connectome.W.copy()
     # Not pytest's tmp_path: those paths overflow the 104-byte AF_UNIX limit.
     with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
-        sidecar = FakeSidecar(f"{tmp}/b.sock", _script(n_ticks), tick_ms=tick_ms)
+        script = _script(n_ticks, tick_ms=tick_ms if state_tick_ms is None else state_tick_ms)
+        sidecar = FakeSidecar(f"{tmp}/b.sock", script, tick_ms=tick_ms)
         agent = _agent(sidecar, W, **params)
         try:
             with agent.client:
@@ -308,6 +318,20 @@ def test_substeps_follow_the_tick_the_sidecar_reports():
 
     pinned, _, _ = run_condition(None, n_ticks=4, tick_ms=100, substeps=50)
     assert pinned.last.substeps == 200  # an explicit override still wins
+
+
+def test_substeps_follow_the_measured_tick_over_the_handshake(capsys):
+    """The sidecar measures the engine mid-run; `ready.tickMs` is only configured."""
+    agent, _, _ = run_condition(None, n_ticks=4, tick_ms=600, state_tick_ms=400)
+    assert agent.tick_ms == 400
+    assert agent.last.substeps == 400  # 4 x 100, not the 600 the handshake claimed
+
+    err = capsys.readouterr().err
+    assert err.count("TICK MISMATCH") == 1  # once, not per tick
+    assert "150 -> 100" in err  # the substep count, 4 sub-frames of each
+
+    pinned, _, _ = run_condition(None, n_ticks=4, tick_ms=600, state_tick_ms=400, substeps=50)
+    assert pinned.last.substeps == 200
 
 
 def test_dry_run_sends_noop_but_still_computes():

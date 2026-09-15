@@ -111,6 +111,10 @@ export interface StateMsg {
     /** States conflated away since the last push. Depth-1: never a queue. */
     droppedSinceLast: number;
     deadlineMs: number;
+    /** The tick the deadline was derived from: observed if it disagrees with `RS_TICK_MS`. */
+    tickMs: number;
+    /** Raw rolling median, null until the meter has enough samples. */
+    observedTickMs: number | null;
     state: NormalizedState;
 }
 

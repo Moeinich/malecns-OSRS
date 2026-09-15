@@ -209,6 +209,10 @@ class StateUpdate:
     tick: int
     dropped_since_last: int
     deadline_ms: int
+    #: The tick the sidecar derived the deadline from, per state.
+    tick_ms: int
+    #: Raw rolling median; None until the sidecar's meter has samples.
+    observed_tick_ms: float | None
     state: WorldState
 
     @classmethod
@@ -218,6 +222,8 @@ class StateUpdate:
             tick=d["tick"],
             dropped_since_last=d["droppedSinceLast"],
             deadline_ms=d["deadlineMs"],
+            tick_ms=d["tickMs"],
+            observed_tick_ms=d.get("observedTickMs"),
             state=WorldState.from_dict(d["state"]),
         )
 

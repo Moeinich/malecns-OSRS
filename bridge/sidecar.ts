@@ -295,6 +295,8 @@ class Sidecar {
             tick: observation.state.tick,
             droppedSinceLast: dropped,
             deadlineMs: this.deadlineMs,
+            tickMs: this.tick.effectiveMs,
+            observedTickMs: this.tick.observedMs,
             state: observation.state,
         });
         if (observation.combatEvents.length > 0 || Object.keys(observation.xpDelta).length > 0) {

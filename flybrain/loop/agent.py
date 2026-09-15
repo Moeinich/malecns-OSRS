@@ -12,6 +12,7 @@ the ablations below are a real test of whether the wiring does any work.
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -112,6 +113,8 @@ class Agent:
         self._ms_lif = 0.0
         self._prev_state = None
         self._prev_heading: float | None = None
+        self._state_tick_ms: int | None = None
+        self._tick_mismatch_logged = False
 
     # ------------------------------------------------------------------ loop
 
@@ -123,6 +126,7 @@ class Agent:
 
     def tick(self, update: StateUpdate) -> TickReport:
         p = self.params
+        self._observe_tick(update)
         t0 = time.perf_counter()
         budget = update.deadline_ms / 1000.0 * p.deadline_fraction
 
@@ -200,9 +204,37 @@ class Agent:
         self.last = report
         return report
 
+    def _observe_tick(self, update: StateUpdate) -> None:
+        """Adopt the tick this state was actually built against.
+
+        The sidecar measures the engine and corrects its own deadline mid-run,
+        so the handshake value can be stale. Adopting it silently would change
+        the substep count with nothing reporting it, which is the same class of
+        bug as deriving it from a wrong tick — so say so, once.
+        """
+        before = self.substeps_per_subframe
+        self._state_tick_ms = update.tick_ms
+        ready = self.client.ready
+        if self._tick_mismatch_logged or ready is None or update.tick_ms == ready.tick_ms:
+            return
+        self._tick_mismatch_logged = True
+        observed = (
+            f"{update.observed_tick_ms:.1f} ms"
+            if update.observed_tick_ms is not None
+            else "not yet measured"
+        )
+        print(
+            f"TICK MISMATCH: the sidecar announced {ready.tick_ms} ms at handshake, "
+            f"but this state was built against {update.tick_ms} ms (observed {observed}). "
+            f"Following it: substeps_per_subframe {before} -> {self.substeps_per_subframe}.",
+            file=sys.stderr,
+        )
+
     @property
     def tick_ms(self) -> int:
-        """The game tick the sidecar reported, or the default until it has."""
+        """The tick the sidecar last measured, else what it announced, else the default."""
+        if self._state_tick_ms is not None:
+            return self._state_tick_ms
         ready = self.client.ready
         return ready.tick_ms if ready is not None else DEFAULT_TICK_MS
 

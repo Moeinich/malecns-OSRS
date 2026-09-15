@@ -101,6 +101,8 @@ def state_msg(revision: int, npc_count: int = 1) -> dict:
         "tick": 88000 + revision,
         "droppedSinceLast": 2,
         "deadlineMs": 240,
+        "tickMs": 400,
+        "observedTickMs": None,
         "state": {
             "tick": 88000 + revision,
             "inGame": True,
