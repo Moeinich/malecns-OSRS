@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,9 +46,6 @@ import numpy as np
 import scipy.sparse as sp
 
 from flybrain.engine.lif import LIFEngine
-
-#: Lamina/medulla columns — the only place sensory current enters the network.
-SENSORY_POPULATIONS = ("L1", "L2", "L3", "Tm1")
 
 #: Resting band for fly central neurons. At dt=1 ms, 5 Hz is 0.5% of neurons per
 #: step — a fifth of the 1% benchmark, so in-band is comfortably inside budget.
@@ -60,6 +57,12 @@ SATURATION_FRACTION = 0.5
 #: Sarle's bimodality coefficient of a uniform distribution. Above it, the rate
 #: distribution is not the lognormal a healthy connectome produces.
 BIMODALITY_UNIFORM = 5.0 / 9.0
+
+#: Membrane noise, in current units. One definition, read by calibration *and* by
+#: the live brain — calibrating with noise and running without it makes the two
+#: different networks, and with a subthreshold input the noise is the only thing
+#: that ever initiates activity.
+DEFAULT_SPONTANEOUS_NOISE_STD = 0.5
 
 Drive = Callable[[int], np.ndarray]
 
@@ -104,6 +107,57 @@ class RateSummary:
 
 
 @dataclass(frozen=True)
+class Acceptance:
+    """What "calibrated" means, in one visible place.
+
+    The mean rate is the only scalar monotone in gain, so it is what the search
+    bisects on — but a mean is not a network. A measured point at 9.99 Hz mean was
+    70.7% silent, bimodal, with a p99 of 172 Hz: two populations, one dead and one
+    avalanching, whose average happens to look plausible. Every threshold here is a
+    judgment call, which is why they are fields and not literals scattered through
+    the search.
+
+    `median_hz > 0` is the strongest clause: the median neuron must fire at all.
+    """
+
+    target_hz: tuple[float, float] = DEFAULT_TARGET_HZ
+    max_silent_fraction: float = 0.35
+    max_saturated_fraction: float = 0.01
+    max_p99_hz: float = 100.0
+    require_median_above_zero: bool = True
+    max_bimodality: float = BIMODALITY_UNIFORM
+
+    def reject(self, r: RateSummary) -> list[str]:
+        """The clauses this rate distribution fails. Empty means accepted."""
+        lo, hi = self.target_hz
+        p99 = r.percentiles_hz[99]
+        checks = (
+            (not lo <= r.mean_hz <= hi, f"mean_hz {r.mean_hz:.3f} outside {lo}-{hi}"),
+            (
+                r.silent_fraction > self.max_silent_fraction,
+                f"silent_fraction {r.silent_fraction:.1%} > {self.max_silent_fraction:.1%}",
+            ),
+            (
+                r.saturated_fraction > self.max_saturated_fraction,
+                (
+                    f"saturated_fraction {r.saturated_fraction:.1%} > "
+                    f"{self.max_saturated_fraction:.1%}"
+                ),
+            ),
+            (p99 > self.max_p99_hz, f"p99_hz {p99:.1f} > {self.max_p99_hz}"),
+            (
+                self.require_median_above_zero and r.median_hz <= 0.0,
+                "median_hz 0 — the median neuron never fires",
+            ),
+            (
+                r.bimodality > self.max_bimodality,
+                f"bimodality {r.bimodality:.3f} > {self.max_bimodality:.3f}",
+            ),
+        )
+        return [why for failed, why in checks if failed]
+
+
+@dataclass(frozen=True)
 class Measurement:
     gain: float
     ms_per_step: float
@@ -115,6 +169,9 @@ class CalibrationResult:
     target_hz: tuple[float, float]
     success: bool
     measurement: Measurement | None = None
+    #: A point whose mean landed in band but whose distribution failed a clause.
+    #: Never `measurement`: `measurement is not None` means calibrated, full stop.
+    rejected: Measurement | None = None
     lower_bracket: Measurement | None = None
     upper_bracket: Measurement | None = None
     failure: str | None = None
@@ -162,7 +219,7 @@ def sensory_drive(
     n: int,
     indices: np.ndarray,
     *,
-    amplitude: float = 20.0,
+    amplitude: float,
     active_fraction: float = 0.01,
     frame_steps: int = FRAME_STEPS,
     seed: int = 0,
@@ -173,6 +230,10 @@ def sensory_drive(
     `tau_m`: a current resampled every step charges nothing and the network stays
     silent regardless of gain. The default is one of the encoder's four sub-frames
     per 600 ms tick, so this is also what the real input looks like.
+
+    `amplitude` has no default on purpose. It used to be a bare 20.0 while the
+    encoder capped at 6.0, so the search tuned a network the live brain never ran;
+    callers now have to say which number they mean.
 
     Each frame is seeded from its own index rather than from a running generator,
     so the drive is a pure function of `step`. A stateful generator would hand a
@@ -199,18 +260,31 @@ def sensory_drive(
     return drive
 
 
-def _as_drive(drive: Drive | np.ndarray | None, n: int, populations) -> Drive:
+def _as_drive(
+    drive: Drive | np.ndarray | None,
+    n: int,
+    populations,
+    injection_types: Sequence[str],
+    amplitude: float | None,
+) -> Drive:
     if callable(drive):
         return drive
     if isinstance(drive, np.ndarray):
         constant = drive.astype(np.float32, copy=True)
         return lambda step: constant
+    if amplitude is None:
+        raise ValueError("deriving a drive needs drive_amplitude — say which current you mean")
     if populations:
-        present = [populations[name] for name in SENSORY_POPULATIONS if name in populations]
+        if not injection_types:
+            raise ValueError(
+                "deriving a drive from populations needs injection_types "
+                "(flybrain.sensory.encode.LUMINANCE_TYPES is what the live path reads)"
+            )
+        present = [populations[name] for name in injection_types if name in populations]
         if not present:
-            raise KeyError(f"none of {SENSORY_POPULATIONS} are in this build")
-        return sensory_drive(n, np.concatenate(present))
-    return sensory_drive(n, np.arange(n))
+            raise KeyError(f"none of {tuple(injection_types)} are in this build")
+        return sensory_drive(n, np.concatenate(present), amplitude=amplitude)
+    return sensory_drive(n, np.arange(n), amplitude=amplitude)
 
 
 def measure_gain(
@@ -222,6 +296,7 @@ def measure_gain(
     warmup_steps: int = DEFAULT_WARMUP_STEPS,
     measure_steps: int = DEFAULT_MEASURE_STEPS,
     v_thresh: np.ndarray | None = None,
+    noise_std: float = DEFAULT_SPONTANEOUS_NOISE_STD,
     engine_kwargs: dict | None = None,
 ) -> Measurement:
     """Run the engine at `gain` and report what the network actually does."""
@@ -232,7 +307,7 @@ def measure_gain(
         scaled,
         dt_ms=dt_ms,
         rate_window_ms=measure_steps * dt_ms,
-        **{"spontaneous_noise_std": 0.5, "seed": 0, **(engine_kwargs or {})},
+        **{"spontaneous_noise_std": noise_std, "seed": 0, **(engine_kwargs or {})},
     )
     if v_thresh is not None:
         engine.v_thresh = np.asarray(v_thresh, dtype=np.float32)
@@ -257,8 +332,11 @@ def calibrate_gain(
     W: sp.csc_matrix,
     *,
     target_hz: tuple[float, float] = DEFAULT_TARGET_HZ,
+    acceptance: Acceptance | None = None,
     drive: Drive | np.ndarray | None = None,
     populations: dict[str, np.ndarray] | None = None,
+    injection_types: Sequence[str] = (),
+    drive_amplitude: float | None = None,
     gain_range: tuple[float, float] = (1e-3, 10.0),
     max_iter: int = 14,
     dt_ms: float = 1.0,
@@ -266,23 +344,41 @@ def calibrate_gain(
     measure_steps: int = DEFAULT_MEASURE_STEPS,
     trim_thresholds: bool = False,
     trim_rounds: int = 3,
+    noise_std: float = DEFAULT_SPONTANEOUS_NOISE_STD,
     engine_kwargs: dict | None = None,
 ) -> CalibrationResult:
-    """Binary-search a scalar synaptic multiplier landing the mean rate in band."""
-    lo_band, hi_band = target_hz
+    """Bisect a scalar synaptic multiplier on the mean rate; accept on `Acceptance`.
+
+    The mean is the search variable because it is the only scalar monotone in gain.
+    It is *not* the acceptance test — a mean in band over a dead median is a failure,
+    and it is returned as one, on `rejected` rather than `measurement`.
+    """
+    accept = acceptance or Acceptance(target_hz=target_hz)
+    lo_band, hi_band = accept.target_hz
     n = W.shape[0]
-    drive_fn = _as_drive(drive, n, populations)
+    drive_fn = _as_drive(drive, n, populations, injection_types, drive_amplitude)
     kw = {
         "dt_ms": dt_ms,
         "warmup_steps": warmup_steps,
         "measure_steps": measure_steps,
+        "noise_std": noise_std,
         "engine_kwargs": engine_kwargs,
     }
 
     def run(gain: float) -> Measurement:
         return measure_gain(W, gain, drive_fn, **kw)
 
-    def done(m: Measurement, iterations: int) -> CalibrationResult:
+    def settle(m: Measurement, iterations: int) -> CalibrationResult:
+        """The mean is in band. Whether that is a calibration is a separate question."""
+        clauses = accept.reject(m.rates)
+        if clauses:
+            return CalibrationResult(
+                target_hz=accept.target_hz,
+                success=False,
+                rejected=m,
+                failure=f"mean in band at gain {m.gain:.6g} but rejected: " + "; ".join(clauses),
+                iterations=iterations,
+            )
         offsets = None
         if trim_thresholds:
             offsets = trim_population_thresholds(
@@ -290,12 +386,12 @@ def calibrate_gain(
                 m.gain,
                 drive_fn,
                 populations or {},
-                target_hz=target_hz,
+                target_hz=accept.target_hz,
                 rounds=trim_rounds,
                 **kw,
             )
         return CalibrationResult(
-            target_hz=target_hz,
+            target_hz=accept.target_hz,
             success=True,
             measurement=m,
             iterations=iterations,
@@ -306,7 +402,7 @@ def calibrate_gain(
     lo_m, hi_m = run(lo), run(hi)
     if lo_m.rates.mean_hz > hi_band:
         return CalibrationResult(
-            target_hz=target_hz,
+            target_hz=accept.target_hz,
             success=False,
             lower_bracket=lo_m,
             upper_bracket=hi_m,
@@ -316,7 +412,7 @@ def calibrate_gain(
         )
     if hi_m.rates.mean_hz < lo_band:
         return CalibrationResult(
-            target_hz=target_hz,
+            target_hz=accept.target_hz,
             success=False,
             lower_bracket=lo_m,
             upper_bracket=hi_m,
@@ -326,20 +422,20 @@ def calibrate_gain(
         )
     for m in (lo_m, hi_m):
         if lo_band <= m.rates.mean_hz <= hi_band:
-            return done(m, 2)
+            return settle(m, 2)
 
     for i in range(max_iter):
         mid = float(np.sqrt(lo * hi))
         m = run(mid)
         if lo_band <= m.rates.mean_hz <= hi_band:
-            return done(m, 3 + i)
+            return settle(m, 3 + i)
         if m.rates.mean_hz < lo_band:
             lo, lo_m = mid, m
         else:
             hi, hi_m = mid, m
 
     return CalibrationResult(
-        target_hz=target_hz,
+        target_hz=accept.target_hz,
         success=False,
         lower_bracket=lo_m,
         upper_bracket=hi_m,
@@ -387,6 +483,7 @@ def _population_rates(
     dt_ms: float = 1.0,
     warmup_steps: int = DEFAULT_WARMUP_STEPS,
     measure_steps: int = DEFAULT_MEASURE_STEPS,
+    noise_std: float = DEFAULT_SPONTANEOUS_NOISE_STD,
     engine_kwargs: dict | None = None,
 ) -> dict[str, float]:
     scaled = sp.csc_matrix(
@@ -396,7 +493,7 @@ def _population_rates(
         scaled,
         dt_ms=dt_ms,
         rate_window_ms=measure_steps * dt_ms,
-        **{"spontaneous_noise_std": 0.5, "seed": 0, **(engine_kwargs or {})},
+        **{"spontaneous_noise_std": noise_std, "seed": 0, **(engine_kwargs or {})},
     )
     engine.v_thresh = thresholds
     for step in range(warmup_steps + measure_steps):
@@ -416,6 +513,7 @@ def format_report(result: CalibrationResult) -> str:
         lines.append(f"reason           {result.failure}")
     for label, m in (
         ("", result.measurement),
+        ("rejected point", result.rejected),
         ("lower bracket", result.lower_bracket),
         ("upper bracket", result.upper_bracket),
     ):
@@ -443,6 +541,11 @@ def format_report(result: CalibrationResult) -> str:
 def main(argv: list[str] | None = None) -> int:
     from flybrain.connectome.loader import DEFAULT_PATH, load
 
+    # Imported here, not at module scope: `flybrain.engine` has no business
+    # depending on `flybrain.sensory`, but the injection layer has exactly one
+    # definition and it is the one the live encoder reads.
+    from flybrain.sensory.encode import LUMINANCE_TYPES, EncodeParams
+
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--path", type=Path, default=DEFAULT_PATH)
     p.add_argument("--target", type=float, nargs=2, default=list(DEFAULT_TARGET_HZ))
@@ -450,15 +553,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-iter", type=int, default=14)
     p.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
     p.add_argument("--measure-steps", type=int, default=DEFAULT_MEASURE_STEPS)
-    p.add_argument("--amplitude", type=float, default=20.0)
+    p.add_argument("--amplitude", type=float, default=EncodeParams().i_max)
     p.add_argument("--active-fraction", type=float, default=0.01)
+    p.add_argument("--noise-std", type=float, default=DEFAULT_SPONTANEOUS_NOISE_STD)
     p.add_argument("--trim-thresholds", action="store_true")
     args = p.parse_args(argv)
 
     connectome = load(args.path)
-    present = [
-        connectome.populations[n] for n in SENSORY_POPULATIONS if n in connectome.populations
-    ]
+    present = [connectome.populations[n] for n in LUMINANCE_TYPES if n in connectome.populations]
     drive = sensory_drive(
         connectome.n,
         np.concatenate(present),
@@ -474,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
         max_iter=args.max_iter,
         warmup_steps=args.warmup_steps,
         measure_steps=args.measure_steps,
+        noise_std=args.noise_std,
         trim_thresholds=args.trim_thresholds,
     )
     print(f"connectome       {args.path}  N={connectome.n}  nnz={connectome.W.nnz}")

@@ -12,6 +12,7 @@ from flybrain.engine.calibrate import (
     SATURATION_FRACTION,
     SUBFRAMES_PER_TICK,
     TICK_MS,
+    Acceptance,
     calibrate_gain,
     format_report,
     measure_gain,
@@ -20,6 +21,11 @@ from flybrain.engine.calibrate import (
 )
 
 FAST = {"warmup_steps": 200, "measure_steps": 400}
+#: A 400-step window quantizes rates to 2.5 Hz, so at a 1-5 Hz mean almost every
+#: neuron reads 0 or 1 spikes and the silent fraction measures the window, not the
+#: network. Any test asserting the *acceptance* predicate needs a window that can
+#: resolve the band it is accepting.
+HONEST = {"warmup_steps": 500, "measure_steps": 4000}
 
 
 def _graded_net(n: int = 500, p: float = 0.02, inhibitory: float = 0.2, seed: int = 1):
@@ -97,7 +103,7 @@ def test_search_finds_a_gain_in_band_when_one_exists():
     W = _graded_net(n)
     drive = _drive(n, background=12.0, sensory=50, active_fraction=0.1)
 
-    result = calibrate_gain(W, drive=drive, gain_range=(1.0, 30.0), max_iter=12, **FAST)
+    result = calibrate_gain(W, drive=drive, gain_range=(1.0, 30.0), max_iter=12, **HONEST)
 
     assert result.success, result.failure
     assert result.failure is None
@@ -139,7 +145,7 @@ def test_gain_range_endpoints_that_miss_the_band_are_named():
 
 
 def test_sensory_drive_holds_a_pattern_for_a_whole_frame():
-    drive = sensory_drive(50, np.arange(20), active_fraction=0.25, frame_steps=10)
+    drive = sensory_drive(50, np.arange(20), amplitude=20.0, active_fraction=0.25, frame_steps=10)
     assert np.array_equal(drive(0), drive(9))
     assert not np.array_equal(drive(0), drive(10))
     assert np.count_nonzero(drive(0)) == 5
@@ -150,9 +156,43 @@ def test_the_drive_frame_is_one_sub_frame_of_a_real_tick():
     """Calibrating against an input shape the encoder never produces tunes for a
     network that does not exist, so the default frame is derived from the tick."""
     assert (TICK_MS, SUBFRAMES_PER_TICK, FRAME_STEPS) == (600, 4, 150)
-    drive = sensory_drive(50, np.arange(20), active_fraction=0.25)
+    drive = sensory_drive(50, np.arange(20), amplitude=20.0, active_fraction=0.25)
     assert np.array_equal(drive(0), drive(FRAME_STEPS - 1))
     assert not np.array_equal(drive(0), drive(FRAME_STEPS))
+
+
+def _feedforward_net(n: int):
+    """No recurrence at all, so the gain is irrelevant and the drive sets the rate."""
+    return sp.csc_matrix((n, n), dtype=np.float32)
+
+
+def test_a_mean_in_band_over_a_silent_majority_is_rejected():
+    """The predicate's whole point: 70% silent at a 4 Hz mean is not calibrated."""
+    rates = np.concatenate([np.zeros(700), np.full(300, 13.0)])
+    clauses = Acceptance().reject(summarize_rates(rates, max_hz=333.0))
+
+    assert "mean_hz" not in " ".join(clauses)  # the mean alone would have passed
+    assert any(c.startswith("silent_fraction") for c in clauses)
+    assert any(c.startswith("median_hz") for c in clauses)
+
+
+def test_a_network_whose_mean_is_in_band_but_is_mostly_silent_fails_the_search():
+    n = 1000
+    W = _feedforward_net(n)
+    # 30% of cells held just above threshold; the rest see nothing at any gain.
+    current = np.zeros(n, dtype=np.float32)
+    current[: int(n * 0.3)] = 15.5
+
+    result = calibrate_gain(W, drive=current, gain_range=(0.5, 2.0), max_iter=4, **FAST)
+
+    assert not result.success
+    assert result.measurement is None
+    assert result.rejected is not None
+    assert 1.0 <= result.rejected.rates.mean_hz <= 5.0
+    assert result.rejected.rates.silent_fraction > 0.65
+    assert "silent_fraction" in result.failure
+    assert "median_hz" in result.failure
+    assert "FAILED" in format_report(result)
 
 
 @pytest.mark.skipif(
@@ -161,9 +201,16 @@ def test_the_drive_frame_is_one_sub_frame_of_a_real_tick():
 )
 def test_real_connectome_calibration_runs():
     from flybrain.connectome.loader import load
+    from flybrain.sensory.encode import LUMINANCE_TYPES, EncodeParams
 
     c = load()
-    result = calibrate_gain(c.W, populations=c.populations, max_iter=10)
+    result = calibrate_gain(
+        c.W,
+        populations=c.populations,
+        injection_types=LUMINANCE_TYPES,
+        drive_amplitude=EncodeParams().i_max,
+        max_iter=10,
+    )
     print(format_report(result))
     assert result.measurement or result.lower_bracket
 
@@ -182,7 +229,7 @@ def test_threshold_trim_moves_an_over_firing_population():
         max_iter=12,
         trim_thresholds=True,
         trim_rounds=2,
-        **FAST,
+        **HONEST,
     )
 
     assert result.success, result.failure

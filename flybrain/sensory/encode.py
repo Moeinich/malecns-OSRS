@@ -42,7 +42,13 @@ SIDES = ("L", "R")
 
 @dataclass(frozen=True)
 class EncodeParams:
-    i_max: float = 6.0
+    #: Peak injected current, in the LIF's units. This is a *sustained* current and
+    #: `v_ss = v_rest + I`, so it has to clear `v_thresh - v_rest = 15` on its own:
+    #: at the old 6.0 a maximally driven column cell sat 9 units below threshold
+    #: permanently, at any synaptic gain, and the brain could not fire at all.
+    #: 24.0 puts a saturated column ~9 units above it — the I=16 regime `tests/
+    #: test_lif.py` already exercises. `test_encode.py` pins the relationship.
+    i_max: float = 24.0
     #: Naka-Rushton exponent and half-saturation point.
     exponent: float = 2.0
     sigma: float = 0.25

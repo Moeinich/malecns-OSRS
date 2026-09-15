@@ -7,9 +7,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import scipy.sparse as sp
 
 from flybrain.connectome import vocab
 from flybrain.connectome.loader import DEFAULT_PATH, load
+from flybrain.engine.lif import LIFEngine
 from flybrain.sensory import encode as encode_mod
 from flybrain.sensory.encode import EncodeParams, encode, map_builds
 from flybrain.sensory.retina import CH_LUMINANCE, CH_THREAT, N_CHANNELS
@@ -71,6 +73,25 @@ def test_naka_rushton_saturates_rather_than_growing_without_bound():
     assert np.all(np.diff(out) > 0)
     assert out[-1] < 1.0
     assert out[-1] == pytest.approx(1.0, abs=1e-6)
+
+
+#: How far a saturated column must sit above threshold, in current units. The
+#: value is arbitrary; the *relationship* is not, and this is what pins it.
+MIN_HEADROOM = 5.0
+
+
+@needs_artifacts
+def test_a_saturated_column_can_actually_reach_threshold(connectome):
+    """The encoder's ceiling is a sustained current and `v_ss = v_rest + I`, so it
+    must clear `v_thresh - v_rest` on its own. At `i_max = 6.0` it sat 9 units short
+    permanently and no synaptic gain could rescue it — the live brain read 0.00 Hz.
+    A change to `i_max` or to the LIF's voltages now breaks a test instead."""
+    engine = LIFEngine(sp.csc_matrix((1, 1), dtype=np.float32))
+    threshold_distance = engine.v_thresh - engine.v_rest
+
+    saturating = encode(_frame(value=1e3), connectome)
+
+    assert saturating.max() > threshold_distance + MIN_HEADROOM
 
 
 # ------------------------------------------------------------------ the map
