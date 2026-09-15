@@ -30,10 +30,6 @@ class MotorParams:
     drive_max_hz: float = 40.0
     run_drive: float = 0.5
     reverse_hz: float = 20.0
-    #: Length of the rate window the rates were measured over, so a rate can be
-    #: converted back to a spike count. Must match `LIFEngine(rate_window_ms=)`.
-    rate_window_s: float = 0.5
-    spike_tolerance: float = 1e-3
     discrete_hz: float = 20.0
     refractory_ticks: int = 2
 
@@ -42,6 +38,22 @@ class MotorParams:
 class _Debounce:
     tick: int = 0
     last: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _Reflex:
+    """Spikes counted inside the current tick, first-past-the-post.
+
+    An all-or-nothing reflex cannot be read off an averaged rate: a Giant Fiber
+    spike early in the tick is evicted from the rate window before the decoder
+    looks. The loop writes the count here as the substeps run, because
+    `decode(rates, motor)` may not grow a third parameter. These are spikes out
+    of the LIF engine, never game state.
+    """
+
+    escape: int = 0
+    #: Substep the first escape spike landed on, so latency can be reported.
+    escape_substep: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +87,22 @@ class MotorIndex:
     pickup: np.ndarray
     params: MotorParams = MotorParams()
     _debounce: _Debounce = field(default_factory=_Debounce)
+    _reflex: _Reflex = field(default_factory=_Reflex)
+
+    def begin_tick(self) -> None:
+        self._reflex.escape = 0
+        self._reflex.escape_substep = None
+
+    def observe_spikes(self, fired: np.ndarray, substep: int) -> None:
+        """Accumulate one substep's reflex spikes. Called during the tick."""
+        if not len(self.escape) or not len(fired):
+            return
+        n = int(np.isin(fired, self.escape).sum())
+        if not n:
+            return
+        if self._reflex.escape == 0:
+            self._reflex.escape_substep = substep
+        self._reflex.escape += n
 
     @classmethod
     def from_connectome(cls, c: _Populations, params: MotorParams | None = None) -> MotorIndex:
@@ -108,10 +136,9 @@ def decode(rates: np.ndarray, motor: MotorIndex) -> EgocentricCommand:
     left, right = _pool(rates, motor.steer_left), _pool(rates, motor.steer_right)
     turn = p.turn_gain * (left - right) / (left + right + p.eps)
 
-    # The Giant Fiber is an all-or-nothing reflex: one spike is the trigger, so
-    # convert the rate back to a spike count rather than thresholding the rate.
-    peak = float(rates[motor.escape].max()) if len(motor.escape) else 0.0
-    escape = peak * p.rate_window_s >= 1.0 - p.spike_tolerance
+    # The Giant Fiber is an all-or-nothing reflex: one spike anywhere in the
+    # tick is the trigger, counted as it happened rather than averaged.
+    escape = motor._reflex.escape > 0
 
     pooled = {
         "attack": _pool(rates, motor.attack),

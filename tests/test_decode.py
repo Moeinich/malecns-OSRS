@@ -10,9 +10,7 @@ from flybrain.motor.decode import EgocentricCommand, MotorIndex, MotorParams, de
 
 N = 40
 
-# One spike in a 50 ms window is 20 Hz, which leaves room for a rate that is
-# high yet still short of a spike.
-PARAMS = MotorParams(rate_window_s=0.05)
+PARAMS = MotorParams()
 
 
 SLOTS = {
@@ -86,14 +84,32 @@ def test_drive_and_reverse_are_pooled_thresholds():
 # -------------------------------------------------------------------- escape
 
 
+def _fired(*neurons: int) -> np.ndarray:
+    return np.array(neurons, dtype=np.int32)
+
+
 def test_a_single_giant_fiber_spike_triggers_escape():
-    one_spike = 1.0 / PARAMS.rate_window_s
-    assert decode(_rates(escape=one_spike), _index()).escape
+    motor = _index()
+    motor.begin_tick()
+    motor.observe_spikes(_fired(SLOTS["escape"][0]), 0)
+    assert decode(_rates(), motor).escape
+    assert motor._reflex.escape_substep == 0
 
 
-def test_a_high_but_sub_spike_rate_does_not_trigger_escape():
-    sub_spike = 0.95 / PARAMS.rate_window_s  # 19 Hz: high, but not one spike
-    assert not decode(_rates(escape=sub_spike), _index()).escape
+def test_a_high_rate_without_a_spike_does_not_trigger_escape():
+    motor = _index()
+    motor.begin_tick()
+    motor.observe_spikes(_fired(*SLOTS["steer_left"]), 0)
+    assert not decode(_rates(escape=1e3), motor).escape
+
+
+def test_begin_tick_clears_the_previous_ticks_spikes():
+    motor = _index()
+    motor.begin_tick()
+    motor.observe_spikes(_fired(SLOTS["escape"][1]), 7)
+    assert decode(_rates(), motor).escape
+    motor.begin_tick()
+    assert not decode(_rates(), motor).escape
 
 
 # ------------------------------------------------------------------ discrete

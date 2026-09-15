@@ -144,6 +144,7 @@ class Agent:
         t_retina = time.perf_counter()
 
         per_subframe = self.substeps_per_subframe
+        self.motor.begin_tick()
         ms_encode = 0.0
         ms_lif = 0.0
         substeps = 0
@@ -152,8 +153,8 @@ class Agent:
             a = time.perf_counter()
             current = self.encoder(frame)
             b = time.perf_counter()
-            for _ in range(per_subframe):
-                self.engine.step(current)
+            for k in range(per_subframe):
+                self.motor.observe_spikes(self.engine.step(current), substeps + k)
             c = time.perf_counter()
             ms_encode += (b - a) * 1e3
             ms_lif += (c - b) * 1e3
@@ -214,6 +215,7 @@ class Agent:
         """
         before = self.substeps_per_subframe
         self._state_tick_ms = update.tick_ms
+        self._ensure_rate_window()
         ready = self.client.ready
         if self._tick_mismatch_logged or ready is None or update.tick_ms == ready.tick_ms:
             return
@@ -229,6 +231,30 @@ class Agent:
             f"Following it: substeps_per_subframe {before} -> {self.substeps_per_subframe}.",
             file=sys.stderr,
         )
+
+    def _ensure_rate_window(self) -> None:
+        """Keep the rate window at least one tick long.
+
+        The decoder samples once per tick, so a window shorter than the tick
+        evicts the tick's first substeps before they are ever read — silently,
+        and worse the faster the server runs.
+        """
+        tick_ms = self.tick_ms
+        pinned = self.params.rate_window_steps
+        if pinned is not None and pinned * self.engine.dt_ms < tick_ms:
+            raise ValueError(
+                f"rate_window_steps={pinned} covers {pinned * self.engine.dt_ms:g} ms, "
+                f"shorter than the {tick_ms} ms tick: every tick would lose its first "
+                f"substeps unread."
+            )
+        if self.engine.rate_window_ms >= tick_ms:
+            return
+        print(
+            f"RATE WINDOW: {self.engine.rate_window_ms:g} ms is shorter than the "
+            f"{tick_ms} ms tick; widening it so no substep is evicted unread.",
+            file=sys.stderr,
+        )
+        self.engine.set_rate_window_ms(float(tick_ms))
 
     @property
     def tick_ms(self) -> int:

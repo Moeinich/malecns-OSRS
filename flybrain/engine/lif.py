@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 import scipy.sparse as sp
 
@@ -64,9 +66,9 @@ class LIFEngine:
         self._indices = self.W.indices
         self._data = self.W.data
 
+        self.rate_window_ms = float(rate_window_ms)
         self._hist_len = max(1, round(rate_window_ms / self.dt_ms))
-        self._hist: list[np.ndarray] = []
-        self._hist_ptr = 0
+        self._hist: deque[np.ndarray] = deque(maxlen=self._hist_len)
         self.steps = 0
 
         self._rng = np.random.default_rng(seed)
@@ -121,17 +123,26 @@ class LIFEngine:
         )
 
     def _record(self, fired: np.ndarray) -> None:
-        if len(self._hist) < self._hist_len:
-            self._hist.append(fired)
-        else:
-            self._hist[self._hist_ptr] = fired
-        self._hist_ptr = (self._hist_ptr + 1) % self._hist_len
+        self._hist.append(fired)
+
+    def set_rate_window_ms(self, rate_window_ms: float) -> None:
+        """Resize the rate window, keeping whatever history still fits.
+
+        A window shorter than the caller's sampling interval evicts the start of
+        every interval before it is ever read, so the loop widens this rather
+        than losing substeps.
+        """
+        n = max(1, round(rate_window_ms / self.dt_ms))
+        self.rate_window_ms = float(rate_window_ms)
+        if n == self._hist_len:
+            return
+        self._hist_len = n
+        self._hist = deque(self._hist, maxlen=n)
 
     def get_firing_rates(self, window: int | None = None) -> np.ndarray:
         n = min(window if window is not None else self._hist_len, len(self._hist))
         if n <= 0:
             return np.zeros(self.N, dtype=np.float32)
-        order = [(self._hist_ptr - 1 - k) % len(self._hist) for k in range(n)]
-        spikes = np.concatenate([self._hist[i] for i in order]) if n else np.empty(0, np.int32)
-        counts = np.bincount(spikes, minlength=self.N).astype(np.float32)
+        recent = list(self._hist)[-n:]
+        counts = np.bincount(np.concatenate(recent), minlength=self.N).astype(np.float32)
         return counts / (n * self.dt_ms / 1000.0)

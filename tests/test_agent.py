@@ -28,7 +28,7 @@ from flybrain.loop.agent import (
     shuffle_degree_preserving,
 )
 from flybrain.loop.client import BridgeClient
-from flybrain.motor.decode import MotorIndex, MotorParams
+from flybrain.motor.decode import MotorIndex, MotorParams, decode
 from flybrain.sensory.collision import CollisionGrid
 from flybrain.sensory.retina import CH_LOOT, CH_LUMINANCE, CH_THREAT, Retina
 
@@ -251,7 +251,7 @@ def _script(n_ticks: int, tick_ms: int = 600) -> list[dict]:
 
 def _agent(sidecar: FakeSidecar, W: sp.csc_matrix, **params) -> Agent:
     connectome = _connectome()
-    motor = MotorIndex.from_connectome(connectome, MotorParams(rate_window_s=0.5))
+    motor = MotorIndex.from_connectome(connectome, MotorParams())
     return Agent(
         client=BridgeClient(sidecar.path, reconnect=False),
         engine=LIFEngine(W, seed=1),
@@ -488,3 +488,72 @@ def test_shuffle_preserves_degree_on_the_real_connectome(capsys):
     assert np.array_equal(_out_degree(W), _out_degree(c.W))
     assert np.array_equal(_in_degree(W), _in_degree(c.W))
     assert conflicts == 0
+
+
+# ------------------------------------------------------- the escape reflex
+
+
+def _escape_index() -> MotorIndex:
+    empty = np.array([], dtype=np.int64)
+    return MotorIndex(
+        steer_left=empty,
+        steer_right=empty,
+        drive=empty,
+        reverse=empty,
+        escape=np.array([0], dtype=np.int64),
+        attack=empty,
+        eat=empty,
+        pickup=empty,
+    )
+
+
+def _tick_with_spike_at(substep: int, n_substeps: int = 600, rate_window_ms: float = 500.0):
+    """One tick of substeps with a single escape spike forced at `substep`."""
+    engine = LIFEngine(sp.csc_matrix((2, 2), dtype=np.float32), rate_window_ms=rate_window_ms)
+    motor = _escape_index()
+    motor.begin_tick()
+    pulse = np.array([500.0, 0.0], dtype=np.float32)
+    zero = np.zeros(2, dtype=np.float32)
+    for k in range(n_substeps):
+        motor.observe_spikes(engine.step(pulse if k == substep else zero), k)
+    return engine.get_firing_rates(), motor
+
+
+@pytest.mark.parametrize("substep", [0, 50, 299, 550, 599])
+def test_an_escape_spike_is_detected_wherever_it_falls_in_the_tick(substep):
+    rates, motor = _tick_with_spike_at(substep)
+    command = decode(rates, motor)
+    assert command.escape, f"escape spike at substep {substep} went undetected"
+    assert motor._reflex.escape_substep == substep
+
+
+def test_the_tick_end_rate_no_longer_decides_the_reflex():
+    """The regression: a 600 ms tick read through a 500 ms window dropped the
+    first 100 ms, so an early Giant Fiber spike was 0 Hz by the time the
+    decoder looked."""
+    early_rates, _ = _tick_with_spike_at(50)
+    late_rates, _ = _tick_with_spike_at(550)
+    assert float(early_rates[0]) == 0.0
+    assert float(late_rates[0]) > 0.0
+
+
+def test_no_spike_is_no_escape():
+    engine = LIFEngine(sp.csc_matrix((2, 2), dtype=np.float32))
+    motor = _escape_index()
+    motor.begin_tick()
+    for k in range(600):
+        motor.observe_spikes(engine.step(np.zeros(2, dtype=np.float32)), k)
+    assert not decode(engine.get_firing_rates(), motor).escape
+
+
+# -------------------------------------------------------- the rate window
+
+
+def test_a_rate_window_shorter_than_the_tick_is_widened():
+    agent, _, _ = run_condition(None, n_ticks=2)
+    assert agent.engine.rate_window_ms >= agent.tick_ms
+
+
+def test_a_pinned_rate_window_shorter_than_the_tick_is_rejected():
+    with pytest.raises(ValueError, match="shorter than the 600 ms tick"):
+        run_condition(None, n_ticks=1, rate_window_steps=100)
