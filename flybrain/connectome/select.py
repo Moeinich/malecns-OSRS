@@ -1,0 +1,301 @@
+"""Subgraph selection over the full MaleCNS connectome.
+
+The whole graph is 152 M edges over 1.8 M bodies and does not fit the tick
+budget, so we cut it down. The cut is made by *connectivity*, not by hand: a
+neuron is kept when it is both reachable from the visual input population and
+able to influence a descending neuron. Anchors we depend on by name are then
+forced in regardless of score, because a network missing DNa02 is not a smaller
+model of the fly, it is a different one.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import pyarrow as pa
+import scipy.sparse as sp
+from pyarrow import ipc
+from scipy.sparse.csgraph import connected_components
+
+from flybrain.connectome import vocab
+from flybrain.connectome.registry import CellTypeRegistry
+
+log = logging.getLogger(__name__)
+
+WEIGHTS_FILENAME = "connectome-weights-male-cns-v1.0-minconf-0.5.feather"
+DEFAULT_WEIGHTS_PATH = vocab.DEFAULT_ANNOTATIONS_PATH.parent / WEIGHTS_FILENAME
+
+#: Lamina/medulla injection sites — the retina drives these, so forward
+#: reachability is measured from here and not from the photoreceptors (which
+#: carry no hex assignment and are never injected into; see the plan).
+VISUAL_INPUT_TYPES = ("L1", "L2", "L3", "Tm1")
+
+#: Named populations forced into the subgraph. The mushroom body is where
+#: learning lives; the central complex is the heading compass.
+ANCHOR_TYPES = ("KC", "MBON", "PPL1", "PAM", "EPG", "PEN", "PEG", "FB")
+
+
+@dataclass(frozen=True)
+class SelectionParams:
+    k: int = 20_000
+    min_syn: int = 5
+    max_edges: int = 3_000_000
+    max_min_syn: int = 64
+    source_types: tuple[str, ...] = VISUAL_INPUT_TYPES
+    anchor_types: tuple[str, ...] = ANCHOR_TYPES
+    #: Resolved from the `superclass` column: the whole 1,314-cell motor bus.
+    anchor_superclasses: tuple[str, ...] = (vocab.DESCENDING_SUPERCLASS,)
+    #: Resolved from the `class` column. `FB*` tangential cells do not resolve
+    #: by name, so the CX is anchored as a class rather than type by type.
+    anchor_classes: tuple[str, ...] = ("CX",)
+    ppr_alpha: float = 0.85
+    ppr_iters: int = 40
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "k": self.k,
+            "min_syn": self.min_syn,
+            "max_edges": self.max_edges,
+            "source_types": list(self.source_types),
+            "anchor_types": list(self.anchor_types),
+            "anchor_superclasses": list(self.anchor_superclasses),
+            "anchor_classes": list(self.anchor_classes),
+            "ppr_alpha": self.ppr_alpha,
+            "ppr_iters": self.ppr_iters,
+        }
+
+
+@dataclass(frozen=True)
+class Selection:
+    """The chosen subgraph, in local index space."""
+
+    #: Annotation row indices of the kept neurons, ascending. Local index `i`
+    #: is `rows[i]`; nothing downstream may address a neuron any other way.
+    rows: np.ndarray
+    body_ids: np.ndarray
+    #: Unsigned synapse counts, local x local, row = presynaptic.
+    weights: sp.csr_matrix
+    achieved_min_syn: int
+    stats: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def n(self) -> int:
+        return len(self.rows)
+
+
+def load_annotated_graph(
+    body_ids: np.ndarray,
+    min_syn: int,
+    weights_path: Path | str = DEFAULT_WEIGHTS_PATH,
+) -> sp.csr_matrix:
+    """Stream the weights table into a CSR graph over the annotated bodies only.
+
+    The file is 151.9 M rows and Feather v2 is LZ4-compressed, so memory-mapping
+    saves nothing and a full materialization is ~3.6 GB. Each record batch is
+    filtered down to annotated endpoints above `min_syn` before anything is kept.
+    """
+    path = Path(weights_path)
+    if not path.exists():
+        raise FileNotFoundError(f"weights not found at {path}; run tools/fetch_connectome.py")
+
+    order = np.argsort(body_ids, kind="stable")
+    sorted_bodies = body_ids[order]
+    if len(np.unique(sorted_bodies)) != len(sorted_bodies):
+        raise ValueError("duplicate bodyIds in the annotations; cannot build a body -> row map")
+
+    pre_parts: list[np.ndarray] = []
+    post_parts: list[np.ndarray] = []
+    weight_parts: list[np.ndarray] = []
+    total_rows = 0
+
+    with ipc.open_file(str(path)) as reader:
+        _check_schema(reader.schema)
+        for i in range(reader.num_record_batches):
+            batch = reader.get_batch(i)
+            total_rows += batch.num_rows
+            weight = batch.column("weight").to_numpy(zero_copy_only=False)
+            keep = weight >= min_syn
+            if not keep.any():
+                continue
+            pre = map_bodies(
+                batch.column("body_pre").to_numpy(zero_copy_only=False)[keep], sorted_bodies
+            )
+            post = map_bodies(
+                batch.column("body_post").to_numpy(zero_copy_only=False)[keep], sorted_bodies
+            )
+            both = (pre >= 0) & (post >= 0)
+            if not both.any():
+                continue
+            pre_parts.append(order[pre[both]])
+            post_parts.append(order[post[both]])
+            weight_parts.append(weight[keep][both].astype(np.float32))
+
+    n = len(body_ids)
+    if not pre_parts:
+        return sp.csr_matrix((n, n), dtype=np.float32)
+
+    graph = sp.coo_matrix(
+        (
+            np.concatenate(weight_parts),
+            (np.concatenate(pre_parts), np.concatenate(post_parts)),
+        ),
+        shape=(n, n),
+        dtype=np.float32,
+    ).tocsr()
+    log.info(
+        "streamed %d rows -> %d edges over %d annotated bodies at min_syn=%d",
+        total_rows,
+        graph.nnz,
+        n,
+        min_syn,
+    )
+    return graph
+
+
+def _check_schema(schema: pa.Schema) -> None:
+    expected = {"body_pre": "int64", "body_post": "int64", "weight": "int64"}
+    actual = {name: str(schema.field(name).type) for name in schema.names if name in expected}
+    if actual != expected:
+        raise ValueError(f"weights schema drifted: expected {expected}, found {dict(actual)}")
+
+
+def map_bodies(values: np.ndarray, sorted_bodies: np.ndarray) -> np.ndarray:
+    """Position of each value in `sorted_bodies`, or -1 when absent."""
+    idx = np.searchsorted(sorted_bodies, values)
+    np.clip(idx, 0, len(sorted_bodies) - 1, out=idx)
+    return np.where(sorted_bodies[idx] == values, idx, -1)
+
+
+def _ppr(graph: sp.csr_matrix, seed: np.ndarray, alpha: float, iters: int) -> np.ndarray:
+    """Personalized PageRank restarting at `seed`, following edge direction."""
+    if seed.sum() <= 0:
+        raise ValueError("empty PPR seed")
+    seed = seed / seed.sum()
+    out_degree = np.asarray(graph.sum(axis=1)).ravel()
+    nonzero = out_degree > 0
+    scale = np.zeros_like(out_degree)
+    scale[nonzero] = 1.0 / out_degree[nonzero]
+    transposed = graph.T.tocsr()
+
+    x = seed.copy()
+    for _ in range(iters):
+        dangling = float(x[~nonzero].sum())
+        x = alpha * (transposed @ (x * scale)) + (alpha * dangling + 1.0 - alpha) * seed
+    return x
+
+
+def _indicator(n: int, rows: np.ndarray) -> np.ndarray:
+    vector = np.zeros(n, dtype=np.float64)
+    vector[rows] = 1.0
+    return vector
+
+
+def _rows_where(table: pa.Table, column: str, values: tuple[str, ...]) -> np.ndarray:
+    if not values:
+        return np.empty(0, dtype=np.int64)
+    entries = table.column(column).to_pylist()
+    wanted = set(values)
+    return np.array([i for i, v in enumerate(entries) if v in wanted], dtype=np.int64)
+
+
+def select(
+    table: pa.Table,
+    registry: CellTypeRegistry,
+    graph: sp.csr_matrix,
+    params: SelectionParams | None = None,
+) -> Selection:
+    """Score by bidirectional PPR, force in the anchors, prune, keep the DN component."""
+    params = params or SelectionParams()
+    n = graph.shape[0]
+    descending = _rows_where(table, "superclass", params.anchor_superclasses)
+    if descending.size == 0:
+        raise ValueError(f"no rows in superclass {params.anchor_superclasses}")
+
+    all_bodies = np.asarray(table.column("bodyId").to_pylist(), dtype=np.int64)
+    sources = np.unique(np.concatenate([registry.population(t) for t in params.source_types]))
+    if sources.size == 0:
+        raise ValueError(f"visual input types {params.source_types} resolved to nothing")
+
+    forward = _ppr(graph, _indicator(n, sources), params.ppr_alpha, params.ppr_iters)
+    backward = _ppr(graph.T.tocsr(), _indicator(n, descending), params.ppr_alpha, params.ppr_iters)
+    score = np.sqrt(forward * backward)
+
+    top = np.argsort(score, kind="stable")[::-1][: params.k]
+    top = top[score[top] > 0]
+
+    anchors = [descending, _rows_where(table, "class", params.anchor_classes)]
+    for name in params.anchor_types:
+        rows = registry.population(name)
+        if rows.size == 0:
+            log.warning("anchor type %r does not resolve in the annotations; skipping", name)
+            continue
+        anchors.append(rows)
+    forced = np.unique(np.concatenate(anchors))
+
+    kept = np.unique(np.concatenate([top, forced]))
+    log.info(
+        "selected %d neurons: %d by score (top-%d), %d forced anchors",
+        kept.size,
+        top.size,
+        params.k,
+        forced.size,
+    )
+
+    min_syn = params.min_syn
+    sub = graph[kept][:, kept]
+    while sub.nnz > params.max_edges and min_syn < params.max_min_syn:
+        min_syn += 1
+        sub.data[sub.data < min_syn] = 0.0
+        sub.eliminate_zeros()
+        log.info("pruned to min_syn=%d -> %d edges", min_syn, sub.nnz)
+    if sub.nnz > params.max_edges:
+        raise RuntimeError(
+            f"{sub.nnz} edges still over budget {params.max_edges} at min_syn={min_syn}"
+        )
+
+    kept, sub = _largest_component_with(kept, sub, descending)
+
+    rows = np.sort(kept)
+    order = np.argsort(kept, kind="stable")
+    sub = sub[order][:, order].tocsr()
+    sub.sort_indices()
+
+    stats = {
+        "n_scored": int(top.size),
+        "n_forced": int(forced.size),
+        "n_neurons": int(rows.size),
+        "n_edges": int(sub.nnz),
+        "n_source_neurons": int(sources.size),
+        "n_descending_selected": int(np.isin(rows, descending).sum()),
+    }
+    return Selection(
+        rows=rows,
+        body_ids=all_bodies[rows],
+        weights=sub,
+        achieved_min_syn=min_syn,
+        stats=stats,
+    )
+
+
+def _largest_component_with(
+    kept: np.ndarray, sub: sp.csr_matrix, descending: np.ndarray
+) -> tuple[np.ndarray, sp.csr_matrix]:
+    count, labels = connected_components(sub, directed=True, connection="weak")
+    if count == 1:
+        return kept, sub
+    is_dn = np.isin(kept, descending)
+    dn_per_label = np.bincount(labels[is_dn], minlength=count)
+    winner = int(np.argmax(dn_per_label))
+    mask = labels == winner
+    log.info(
+        "weak components: %d; keeping the one holding %d/%d descending neurons (%d neurons)",
+        count,
+        int(dn_per_label[winner]),
+        int(is_dn.sum()),
+        int(mask.sum()),
+    )
+    keep_idx = np.flatnonzero(mask)
+    return kept[keep_idx], sub[keep_idx][:, keep_idx]
