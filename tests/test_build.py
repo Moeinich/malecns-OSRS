@@ -251,3 +251,34 @@ def test_the_build_is_the_size_it_claims(built):
     _, provenance = built
     assert provenance["achieved"]["n_neurons"] > 20_000
     assert provenance["achieved"]["n_edges"] <= SelectionParams().max_edges
+
+
+def test_soma_positions_are_real_coordinates_for_most_of_the_selection(connectome, built):
+    """Real EM soma coordinates, and NaN — never (0, 0, 0) — where there are none.
+
+    The lamina is the hole: L1 carries a soma annotation for about a sixth of
+    its cells. A zero fill would pile those thousands on the origin and draw as
+    a dense structure that is not in the fly.
+    """
+    pos = connectome.soma_positions
+    assert pos.shape == (connectome.n, 3)
+    assert pos.dtype == np.float32
+
+    present = np.isfinite(pos).all(axis=1)
+    assert present.mean() > 0.85
+    assert np.isnan(pos[~present]).all(), "a missing soma must be NaN, not a coordinate"
+    assert not (pos[present] == 0).all(axis=1).any()
+
+    coverage = built[1]["soma_position_coverage"]
+    assert coverage == pytest.approx(float(present.mean()))
+
+    # The v1.0 EM volume, as the release ships it.
+    assert pos[present].min() > 0
+    assert pos[present].max() < 200_000
+
+
+def test_the_populations_the_telemetry_colours_by_are_positioned(connectome):
+    """A functional group with no positioned cell cannot be drawn at all."""
+    for name in ("T4", "T5", "KC", "PAM", "DNp01", "DNa02", "FB"):
+        idx = connectome.population(name)
+        assert np.isfinite(connectome.soma_positions[idx]).all(axis=1).mean() > 0.9, name

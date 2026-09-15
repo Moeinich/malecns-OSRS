@@ -33,6 +33,9 @@ class Connectome:
     body_ids: np.ndarray
     populations: dict[str, np.ndarray]
     provenance: dict[str, object]
+    #: `float32[n, 3]` EM soma coordinates, NaN where the release annotates no
+    #: soma. `None` only for a connectome that was not built from the release.
+    soma_positions: np.ndarray | None = None
 
     @property
     def n(self) -> int:
@@ -73,6 +76,7 @@ def load(path: Path | str = DEFAULT_PATH) -> Connectome:
             body_ids=data["body_ids"],
             populations=populations,
             provenance=json.loads(str(data["provenance"])),
+            soma_positions=data["soma_positions"],
         )
 
 

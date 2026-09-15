@@ -67,6 +67,15 @@ class TickReport:
     substeps: int
     overrun: bool
     dropped_game_ticks: int
+    #: The sidecar's stated deadline for this tick, not the tick length.
+    deadline_ms: float
+    #: The rate vector `decode` was handed. Telemetry reads populations out of
+    #: it; nothing in the loop may read it back into a decision.
+    rates: np.ndarray
+    #: Reflex spikes counted inside this tick, and the substep the first landed
+    #: on. `None` substep means none fired — never drawn as a zero.
+    escape_spikes: int
+    escape_substep: int | None
 
     @property
     def kind(self) -> str:
@@ -94,6 +103,7 @@ class Agent:
         heading: Heading | None = None,
         params: AgentParams | None = None,
         body_params: BodyParams | None = None,
+        spike_sink: Callable[[np.ndarray], None] | None = None,
     ) -> None:
         self.client = client
         self.engine = engine
@@ -104,10 +114,16 @@ class Agent:
         self.heading = heading if heading is not None else Heading()
         self.params = params if params is not None else AgentParams()
         self.body_params = body_params
+        #: Called with each substep's fired indices. Telemetry only; the loop
+        #: never reads it back.
+        self.spike_sink = spike_sink
 
         self.ticks = 0
         self.overruns = 0
         self.last: TickReport | None = None
+        #: The sub-frames this tick was built from, kept so telemetry can show
+        #: the retina the brain was actually given rather than re-render one.
+        self.last_frames: np.ndarray | None = None
         self.action_counts: dict[str, int] = {}
         self._ms_total = 0.0
         self._ms_lif = 0.0
@@ -141,9 +157,11 @@ class Agent:
             n=p.subframes,
             prev_heading=self._prev_heading,
         )
+        self.last_frames = frames
         t_retina = time.perf_counter()
 
         per_subframe = self.substeps_per_subframe
+        sink = self.spike_sink
         self.motor.begin_tick()
         ms_encode = 0.0
         ms_lif = 0.0
@@ -154,7 +172,10 @@ class Agent:
             current = self.encoder(frame)
             b = time.perf_counter()
             for k in range(per_subframe):
-                self.motor.observe_spikes(self.engine.step(current), substeps + k)
+                fired = self.engine.step(current)
+                self.motor.observe_spikes(fired, substeps + k)
+                if sink is not None:
+                    sink(fired)
             c = time.perf_counter()
             ms_encode += (b - a) * 1e3
             ms_lif += (c - b) * 1e3
@@ -199,6 +220,10 @@ class Agent:
             substeps=substeps,
             overrun=overrun,
             dropped_game_ticks=self.client.dropped_game_ticks,
+            deadline_ms=float(update.deadline_ms),
+            rates=rates,
+            escape_spikes=self.motor._reflex.escape,
+            escape_substep=self.motor._reflex.escape_substep,
         )
         self._ms_total += report.ms_total
         self._ms_lif += report.ms_lif

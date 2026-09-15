@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="LIF steps per sub-frame; default derives it from the tick the sidecar reports",
     )
+    p.add_argument(
+        "--hud",
+        action="store_true",
+        help="live OpenCV telemetry window; q closes it, the brain keeps running",
+    )
     return p
 
 
@@ -68,24 +73,43 @@ def main(argv: list[str] | None = None) -> int:
     for note in ablation.notes:
         print(f"  {note}", file=sys.stderr)
 
+    engine = LIFEngine(W, seed=args.seed)
+    # Imported only here: the brain must not depend on OpenCV being installed.
+    hud = None
+    if args.hud:
+        from flybrain.hud import Hud
+
+        hud = Hud.create(
+            populations=connectome.populations,
+            soma_positions=connectome.soma_positions,
+            n=connectome.n,
+            dt_ms=engine.dt_ms,
+            log=lambda m: print(m, file=sys.stderr),
+        )
+
     agent = Agent(
         client=BridgeClient(args.socket or default_socket_path()),
-        engine=LIFEngine(W, seed=args.seed),
+        engine=engine,
         motor=MotorIndex.from_connectome(connectome),
         collision=CollisionGrid.load(args.collision),
         encoder=default_encoder(connectome),
         params=AgentParams(substeps_per_subframe=args.substeps, dry_run=args.dry_run),
+        spike_sink=hud.record_spikes if hud is not None and hud.enabled else None,
     )
 
     started = time.monotonic()
     try:
         with agent.client:
             for report in agent.run(args.ticks):
+                if hud is not None:
+                    hud.update(agent, report)
                 if args.status_every and agent.ticks % args.status_every == 0:
                     print(_status(agent, report), file=sys.stderr)
     except KeyboardInterrupt:
         pass
     finally:
+        if hud is not None:
+            hud.close()
         print(_summary(agent, ablation, time.monotonic() - started), file=sys.stderr)
     return 0
 

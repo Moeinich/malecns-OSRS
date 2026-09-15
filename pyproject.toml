@@ -6,6 +6,8 @@ dependencies = [
     "numpy>=2.4",
     "scipy>=1.17",
     "pyarrow",
+    # The telemetry HUD only. Imported behind --hud, never by the tick loop.
+    "opencv-python",
 ]
 
 [dependency-groups]

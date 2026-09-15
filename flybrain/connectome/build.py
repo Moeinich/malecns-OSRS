@@ -62,6 +62,10 @@ UNKNOWN_SIGNS = {"excitatory": 1, "inhibitory": -1, "zero": 0}
 
 POPULATION_SEPARATOR = "|"
 
+#: Real EM soma coordinates, `list<int64>` of `[x, y, z]`. Not in
+#: `vocab.REQUIRED_COLUMNS`: nothing in the model reads it, only telemetry.
+SOMA_COLUMN = "somaLocation"
+
 
 class UnknownNeurotransmitterError(RuntimeError):
     """Too much of the network has no transmitter call to be worth simulating."""
@@ -158,6 +162,29 @@ def sign_weights(
     return signed, stats
 
 
+def soma_positions(
+    rows: np.ndarray, annotations_path: Path = vocab.DEFAULT_ANNOTATIONS_PATH
+) -> np.ndarray:
+    """Soma coordinates for the selected annotation rows, `float32[N, 3]`.
+
+    NaN where the release annotates no soma — about 11% of the selection, and
+    almost all of the lamina. `(0, 0, 0)` would pile those at the origin and
+    draw as a structure that is not in the fly.
+    """
+    column = feather.read_table(annotations_path, columns=[SOMA_COLUMN]).column(SOMA_COLUMN)
+    array = column.combine_chunks()
+    if isinstance(array, pa.ChunkedArray):
+        array = array.chunk(0)
+
+    offsets = np.asarray(array.offsets)
+    start = offsets[rows]
+    present = np.asarray(array.is_valid())[rows] & (offsets[rows + 1] - start == 3)
+
+    out = np.full((len(rows), 3), np.nan, dtype=np.float32)
+    out[present] = np.asarray(array.values)[start[present][:, None] + np.arange(3)]
+    return out
+
+
 def named_populations(registry: CellTypeRegistry, rows: np.ndarray) -> dict[str, np.ndarray]:
     """Local indices for every declared cell type, plus its left/right halves."""
     with registry_mod.CELL_TYPES_PATH.open("rb") as f:
@@ -204,12 +231,16 @@ def build(
     signed, sign_stats = sign_weights(selection.weights, labels, build_params)
 
     populations = named_populations(reg, selection.rows)
+    somas = soma_positions(selection.rows, annotations_path)
+    soma_coverage = float(np.isfinite(somas[:, 0]).mean())
+    log.info("soma coordinates for %.1f%% of the selection", 100 * soma_coverage)
     provenance = {
         "dataset": "MaleCNS v1.0 (CC-BY), minconf 0.5",
         "sources": file_provenance(),
         "selection": selection_params.as_dict() | {"achieved_min_syn": selection.achieved_min_syn},
         "achieved": selection.stats | sign_stats,
         "nt_resolution": resolved_by,
+        "soma_position_coverage": soma_coverage,
         "population_body_ids": {
             name: selection.body_ids[idx].tolist() for name, idx in populations.items()
         },
@@ -228,6 +259,7 @@ def build(
         "shape": np.array(csc.shape, dtype=np.int64),
         "body_ids": selection.body_ids,
         "annotation_rows": selection.rows,
+        "soma_positions": somas,
         "csc_data": csc.data.astype(np.float32, copy=False),
         "csc_indices": csc.indices,
         "csc_indptr": csc.indptr,
