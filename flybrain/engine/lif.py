@@ -23,6 +23,8 @@ class LIFEngine:
         v_thresh: float = -50.0,
         tau_m: float = 20.0,
         tau_s: float = 5.0,
+        tau_w: float = 150.0,
+        b: float = 2.0,
         refractory_ms: float = 2.0,
         transmission_delay_ms: float = 1.8,
         spontaneous_noise_std: float = 0.0,
@@ -46,10 +48,13 @@ class LIFEngine:
         self.v_thresh = float(v_thresh)
         self.tau_m = float(tau_m)
         self.tau_s = float(tau_s)
+        self.tau_w = float(tau_w)
+        self.b = float(b)
         self.spontaneous_noise_std = float(spontaneous_noise_std)
 
         self.av = float(np.exp(-self.dt_ms / self.tau_m))
         self.ag = float(np.exp(-self.dt_ms / self.tau_s))
+        self.aw = float(np.exp(-self.dt_ms / self.tau_w))
         self._one_minus_av = 1.0 - self.av
 
         self.refractory_steps = round(refractory_ms / self.dt_ms)
@@ -57,6 +62,10 @@ class LIFEngine:
 
         self.v = np.full(self.N, self.v_rest, dtype=np.float32)
         self.g = np.zeros(self.N, dtype=np.float32)
+        # Spike-frequency adaptation current, kept separate from `g` so it is never
+        # deposited through the delay ring. It only ever subtracts from `drive`, so a
+        # silent neuron stays silent: adaptation cannot manufacture a spike.
+        self.w = np.zeros(self.N, dtype=np.float32)
         self.refractory = np.zeros(self.N, dtype=np.int32)
 
         self._ring = np.zeros((self.delay_slots + 1, self.N), dtype=np.float32)
@@ -84,10 +93,12 @@ class LIFEngine:
             drive = external_current.astype(np.float32, copy=True)
 
         self.g *= self.ag
+        self.w *= self.aw
         slot = self._ring[self._ring_ptr]
         self.g += slot
         slot[:] = 0.0
         drive += self.g
+        drive -= self.w
 
         if self.spontaneous_noise_std > 0.0:
             drive += self._rng.normal(0.0, self.spontaneous_noise_std, self.N).astype(np.float32)
@@ -102,6 +113,7 @@ class LIFEngine:
         if fired.size:
             self.v[fired] = self.v_reset
             self.refractory[fired] = self.refractory_steps
+            self.w[fired] += self.b
             self._deposit(fired)
 
         self._ring_ptr = (self._ring_ptr + 1) % self._ring.shape[0]

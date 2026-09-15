@@ -147,3 +147,29 @@ def test_a_short_rate_window_evicts_an_early_spike():
     for k in range(600):
         eng.step(pulse if k == 50 else zero)
     assert float(eng.get_firing_rates()[0]) == 0.0
+
+
+def test_adaptation_lowers_the_rate_over_a_constant_current():
+    eng = _engine(1)
+    fired = _run(eng, np.full(1, 20.0, dtype=np.float32), 2000)
+    steps = _spike_steps(fired, 0)
+    q = len(fired) // 4
+    first = sum(1 for k in steps if k < q)
+    last = sum(1 for k in steps if k >= 3 * q)
+    print(f"\nadaptation at I=20: first quarter {first} spikes, last quarter {last}")
+    assert last < first, (first, last)
+
+
+def test_zero_adaptation_leaves_the_unadapted_train_untouched():
+    """`b=0.0` must be a true off switch, so the pre-adaptation numbers stay reachable."""
+    cur = np.full(1, 20.0, dtype=np.float32)
+    off = _engine(1, b=0.0)
+    steps_off = _spike_steps(_run(off, cur, 2000), 0)
+
+    assert np.all(off.w == 0.0)
+    # Unadapted, a constant current gives a perfectly periodic train.
+    assert len(set(np.diff(steps_off))) == 1, np.diff(steps_off)
+
+    on = _engine(1)
+    steps_on = _spike_steps(_run(on, cur, 2000), 0)
+    assert len(steps_on) < len(steps_off), (len(steps_on), len(steps_off))
