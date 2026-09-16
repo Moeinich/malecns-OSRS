@@ -1,5 +1,6 @@
 """Supervisor tests. Hermetic: trivial python children, never the real stack."""
 
+import io
 import os
 import signal
 import socket
@@ -9,7 +10,18 @@ import time
 
 import pytest
 
-from flybrain.app import LONG, SHORT, Service, ServiceFailed, Supervisor, group_alive, probe
+from flybrain import app
+from flybrain.app import (
+    LONG,
+    SHORT,
+    Service,
+    ServiceFailed,
+    Supervisor,
+    bot_save_path,
+    group_alive,
+    main,
+    probe,
+)
 
 # Spawns a grandchild, prints its pid, then sleeps. The grandchild is the point:
 # it is what `kill <pid>` on the leader would leave orphaned.
@@ -199,3 +211,99 @@ def test_status_reports_every_service_and_its_log(tmp_path, sup):
     out = sup.status()
     assert "a" in out and "b" in out
     assert str(sup.services[0].log_path(tmp_path)) in out
+
+
+# --- reset-bot ----------------------------------------------------------
+
+
+@pytest.fixture
+def reset_stack(tmp_path, sup):
+    """A running client + sidecar, a save file, and a captured output stream."""
+    client = sleeper(tmp_path, name="lite", tier=LONG)
+    sidecar = sleeper(tmp_path, name="sidecar", tier=SHORT)
+    sup.services = [client, sidecar]
+    sup.up()
+    sup.out = io.StringIO()
+    save = tmp_path / "flybot01.sav"
+    save.write_bytes(b"x" * 862)
+    return sup, client, sidecar, save
+
+
+def logged_out(*_args, **_kwargs):
+    return False
+
+
+def order_of(out: str, *lines: str) -> list[int]:
+    said = out.splitlines()
+    return [said.index(line) for line in lines]
+
+
+def test_reset_bot_cycles_the_client_inside_the_sidecar(reset_stack, monkeypatch):
+    sup, client, sidecar, save = reset_stack
+    monkeypatch.setattr(app, "gateway_in_game", logged_out)
+    sup.reset_bot("flybot01", client, sidecar, save, settle=0.0)
+
+    stop_sidecar, stop_client, start_client, start_sidecar = order_of(
+        sup.out.getvalue(),
+        "sidecar: stopped",
+        "lite: stopped",
+        "lite: started",
+        "sidecar: started",
+    )
+    assert stop_sidecar < stop_client, "the controller must go down before the client"
+    assert start_client < start_sidecar, "the sidecar must log in to a client that exists"
+    assert not save.exists()
+
+
+def test_reset_bot_deletes_the_save_only_once_logged_out(reset_stack, monkeypatch):
+    sup, client, sidecar, save = reset_stack
+    seen = []
+
+    def still_in_game(*_args, **_kwargs):
+        seen.append(save.exists())
+        return len(seen) < 3
+
+    monkeypatch.setattr(app, "gateway_in_game", still_in_game)
+    sup.reset_bot("flybot01", client, sidecar, save, settle=0.0)
+
+    assert seen == [True, True, True], "the save was touched while the bot was still in game"
+    assert not save.exists()
+
+
+def test_reset_bot_refuses_to_delete_a_save_it_cannot_prove_is_idle(reset_stack, monkeypatch):
+    sup, client, sidecar, save = reset_stack
+    monkeypatch.setattr(app, "gateway_in_game", lambda *a, **k: True)
+
+    with pytest.raises(ServiceFailed) as exc:
+        sup.reset_bot("flybot01", client, sidecar, save, timeout=0.5, settle=0.0)
+
+    assert save.read_bytes() == b"x" * 862, "a bot that never logged out lost its save"
+    assert "still in game" in str(exc.value)
+    assert "sidecar stopped" in str(exc.value), "a half-reset must say what it did"
+    assert "sidecar" not in sup._load_state(), "the stopped services were silently restarted"
+
+
+def test_reset_bot_survives_a_missing_save(reset_stack, monkeypatch):
+    sup, client, sidecar, save = reset_stack
+    save.unlink()
+    monkeypatch.setattr(app, "gateway_in_game", logged_out)
+    sup.reset_bot("flybot01", client, sidecar, save, settle=0.0)
+    assert "already fresh" in sup.out.getvalue()
+
+
+def test_reset_bot_parses_with_bot_and_client(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        Supervisor,
+        "reset_bot",
+        lambda self, bot, client, sidecar, save: seen.update(
+            bot=bot, client=client.name, sidecar=sidecar.name, save=save
+        ),
+    )
+    assert main(["reset-bot", "--bot", "flybot09", "--client", "browser"]) == 0
+    assert seen == {
+        "bot": "flybot09",
+        "client": "browser",
+        "sidecar": "sidecar",
+        "save": bot_save_path("flybot09"),
+    }

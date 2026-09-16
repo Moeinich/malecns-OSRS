@@ -27,6 +27,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +40,9 @@ STATE_PATH = RUN_DIR / "supervisor.json"
 DEFAULT_TICKRATE = 600
 DEFAULT_BOT = "flybot01"
 GRACE_SECONDS = 5.0
+GATEWAY_URL = os.environ.get("RS_GATEWAY_URL", "http://localhost:7780")
+LOGOUT_TIMEOUT = 30.0
+SAVE_SETTLE_SECONDS = 1.0
 
 LONG = "long"
 SHORT = "short"
@@ -148,6 +153,28 @@ def default_services(
         # job. Nothing else has to change — tier membership is the whole
         # contract, and `restart-short` will pick them up for free.
     ]
+
+
+def bot_save_path(bot: str, rs_sdk: Path = RS_SDK) -> Path:
+    """With the login server off, this file *is* the character."""
+    return rs_sdk / "server" / "engine" / "data" / "players" / "main" / f"{bot}.sav"
+
+
+def gateway_in_game(bot: str, gateway: str = GATEWAY_URL) -> bool:
+    """Ask the gateway whether the bot is still in the world.
+
+    A 404 means the gateway has forgotten it, which is as logged-out as it
+    gets. Anything else unanswerable raises: never guess about a save.
+    """
+    try:
+        with urllib.request.urlopen(f"{gateway}/status/{bot}", timeout=5) as response:
+            return bool(json.loads(response.read()).get("inGame"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        raise ServiceFailed(f"gateway: /status/{bot} answered {exc.code}") from exc
+    except (OSError, ValueError) as exc:
+        raise ServiceFailed(f"gateway: unreachable at {gateway} ({exc})") from exc
 
 
 def _prepare_env(service: Service) -> dict[str, str]:
@@ -364,6 +391,76 @@ class Supervisor:
         self.stop(tiers=(SHORT,))
         self.up(tiers=(SHORT,), adopt=adopt)
 
+    def _stop_one(self, name: str, grace: float = GRACE_SECONDS) -> str:
+        entry = self._load_state().get(name)
+        if entry is None:
+            return "not running"
+        result = self._kill_group(name, entry["pgid"], grace)
+        self._forget(name)
+        return result
+
+    def _half_done(self, what: str, done: list[str]) -> ServiceFailed:
+        return ServiceFailed(f"reset-bot: {what}\n  done: {', '.join(done) or 'nothing'}")
+
+    def reset_bot(
+        self,
+        bot: str,
+        client_service: Service,
+        sidecar_service: Service,
+        save_path: Path,
+        gateway: str = GATEWAY_URL,
+        timeout: float = LOGOUT_TIMEOUT,
+        settle: float = SAVE_SETTLE_SECONDS,
+    ) -> None:
+        """Give the bot a brand-new character by deleting its engine save.
+
+        The engine holds a logged-in player in memory and writes the save on
+        logout and every `PLAYER_SAVERATE`, so deleting underneath a live
+        player is simply undone. Hence: controller down, client down, wait for
+        the gateway to report the logout, wait for the file to stop moving,
+        only then unlink. The long tier stays up throughout.
+        """
+        done: list[str] = []
+        for service in (sidecar_service, client_service):
+            self._say(f"{service.name}: {self._stop_one(service.name)}")
+            done.append(f"{service.name} stopped")
+
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                still_in_game = gateway_in_game(bot, gateway)
+            except ServiceFailed as exc:
+                raise self._half_done(f"{exc}; save left alone", done) from exc
+            if not still_in_game:
+                break
+            if time.monotonic() >= deadline:
+                raise self._half_done(
+                    f"{bot} still in game after {timeout:.0f}s; save left alone", done
+                )
+            time.sleep(0.25)
+        self._say(f"{bot}: logged out")
+
+        if save_path.exists():
+            size = save_path.stat().st_size
+            mtime = save_path.stat().st_mtime_ns
+            time.sleep(settle)
+            if save_path.stat().st_mtime_ns != mtime:
+                raise self._half_done(f"{save_path} is still being written; not deleted", done)
+            save_path.unlink()
+            self._say(f"save: deleted {save_path} ({size} B)")
+            done.append("save deleted")
+        else:
+            self._say(f"save: {save_path} is absent; the character is already fresh")
+
+        for service in (client_service, sidecar_service):
+            try:
+                self._say(f"{service.name}: {self.start(service)}")
+            except (ServiceFailed, subprocess.CalledProcessError) as exc:
+                raise self._half_done(f"{service.name} did not come back: {exc}", done) from exc
+            done.append(f"{service.name} started")
+
+        self._say(self.status())
+
     # --- observation ----------------------------------------------------
 
     def deaths(self) -> list[str]:
@@ -458,7 +555,7 @@ class Supervisor:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="flybrain.app", description=__doc__)
-    parser.add_argument("command", choices=["up", "down", "restart-short", "status"])
+    parser.add_argument("command", choices=["up", "down", "restart-short", "reset-bot", "status"])
     parser.add_argument("--tickrate", type=int, default=DEFAULT_TICKRATE)
     parser.add_argument("--bot", default=DEFAULT_BOT)
     parser.add_argument(
@@ -494,6 +591,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "restart-short":
         sup.restart_short(adopt=args.adopt)
         print(sup.status())
+        return 0
+    if args.command == "reset-bot":
+        client = next(s for s in sup.services if s.name in (LITE, BROWSER))
+        sidecar = next(s for s in sup.services if s.name == "sidecar")
+        try:
+            sup.reset_bot(args.bot, client, sidecar, bot_save_path(args.bot))
+        except (ServiceFailed, subprocess.CalledProcessError) as exc:
+            print(f"\n{exc}", file=sys.stderr)
+            return 1
         return 0
 
     try:
