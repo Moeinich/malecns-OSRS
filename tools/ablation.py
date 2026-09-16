@@ -66,6 +66,14 @@ DEFAULT_CONDITIONS = (
 BASELINE = "real"
 DEFAULT_PRIMARY = "moving_fraction"
 
+#: The Lumbridge spawn tile every scored episode starts from. Without it each
+#: episode starts wherever the last one ended, and since conditions run in
+#: sequence, position drift is a confound on every contrast.
+DEFAULT_START = (3222, 3218)
+
+#: How long a reset walk may take before the stack counts as down.
+RESET_TIMEOUT_S = 90.0
+
 SCALAR_METRICS = (
     "kills_per_hr",
     "xp_per_hr",
@@ -180,6 +188,9 @@ class Episode:
     wall_s: float
     records: tuple[TickRecord, ...]
     dropped_game_ticks: int = 0
+    #: Where the episode began: the acked reset tile, or the first scored tick
+    #: when resets are off. Never blank, so a drifted run is visible afterwards.
+    start: tuple[int, int] | None = None
     #: The tick length the sidecar measured, when it measured one. `None` is
     #: "never reported", not "matches the configured value".
     observed_tick_ms: float | None = None
@@ -609,6 +620,7 @@ class RunMeta:
     configured_tick_ms: int | None = None
     observed_tick_ms: float | None = None
     hud: bool = False
+    start: tuple[int, int] | None = None
 
 
 def _tick_mismatch(meta: RunMeta) -> list[str]:
@@ -723,6 +735,11 @@ def report(
             f"learning {'ON' if meta.learn else 'OFF (weights frozen)'}"
         ),
         f"hud                {'on' if meta.hud else 'off'}",
+        (
+            f"start              {meta.start[0]}, {meta.start[1]} (every episode reset here)"
+            if meta.start
+            else "start              not reset (every episode began where the last one ended)"
+        ),
         "",
         "-- means per condition " + "-" * 55,
     ]
@@ -835,6 +852,7 @@ class Stack:
     learn: bool
     substeps: int | None
     hud: bool = False
+    start: tuple[int, int] | None = DEFAULT_START
 
 
 def connect(socket_path: str, timeout: float = 30.0) -> BridgeClient:
@@ -920,6 +938,20 @@ def hud_tick(
     return tick
 
 
+def reset_to_start(client: BridgeClient, start: tuple[int, int]) -> tuple[int, int]:
+    """Walk the bot back to `start`, or `StackDown`. Never scores a misplaced episode."""
+    try:
+        cmd_id = client.send_reset(*start)
+        ok, x, z = client.wait_reset(cmd_id, RESET_TIMEOUT_S)
+    except (ConnectionError, OSError, TimeoutError) as exc:
+        raise StackDown(f"the stack dropped during the reset to {start}: {exc}") from exc
+    if not ok:
+        raise StackDown(f"the reset to {start} failed; the bot is at ({x}, {z})")
+    if max(abs(x - start[0]), abs(z - start[1])) > 1:
+        raise StackDown(f"the reset to {start} landed at ({x}, {z}), more than a tile away")
+    return x, z
+
+
 def run_condition(
     stack: Stack,
     condition: str,
@@ -940,6 +972,7 @@ def run_condition(
                 if hud is None
                 else hud_tick(agent, hud, feed, condition, i + 1, episodes, ticks)
             )
+            start = reset_to_start(client, stack.start) if stack.start else None
             episode = record_episode(
                 alive_states(client),
                 driver,
@@ -952,7 +985,12 @@ def run_condition(
             # Before the first state arrives `agent.tick_ms` is only the default,
             # so the rates would be scored against a tickrate the stack is not
             # running. Take it again once the episode has seen the handshake.
-            episode = replace(episode, tick_ms=agent.tick_ms)
+            first = episode.records[0]
+            episode = replace(
+                episode,
+                tick_ms=agent.tick_ms,
+                start=start if start is not None else (first.x, first.z),
+            )
         finally:
             client.close()
         print(
@@ -979,6 +1017,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--collision", default=str(DEFAULT_COLLISION_PATH))
     p.add_argument("--calibration", default=str(DEFAULT_CALIBRATION_PATH))
     p.add_argument("--substeps", type=int, default=None)
+    p.add_argument(
+        "--start",
+        type=int,
+        nargs=2,
+        metavar=("X", "Z"),
+        default=list(DEFAULT_START),
+        help="the tile every episode is reset to before it is scored",
+    )
+    p.add_argument(
+        "--no-reset",
+        action="store_true",
+        help="score from wherever the last episode ended (position drift is then a confound)",
+    )
     p.add_argument("--dry-run", action="store_true", help="score the brain without moving the bot")
     p.add_argument("--out", default=None, help="write the JSON report here")
     p.add_argument(
@@ -1007,6 +1058,7 @@ def main(argv: list[str] | None = None) -> int:
         learn=False,
         substeps=args.substeps,
         hud=args.hud,
+        start=None if args.no_reset else (args.start[0], args.start[1]),
     )
     connectome = load(args.connectome)
     validate_conditions(args.conditions, connectome, args.seed)
@@ -1024,6 +1076,7 @@ def main(argv: list[str] | None = None) -> int:
         calibration_params=calibration_params(calibration),
         started=time.strftime("%Y-%m-%dT%H:%M:%S"),
         hud=args.hud,
+        start=stack.start,
     )
 
     hud = feed = None

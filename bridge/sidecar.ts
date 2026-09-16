@@ -16,6 +16,7 @@ import {
     type AckMsg,
     type MotorAction,
     type ReadyMsg,
+    type ResetMsg,
     type Role,
     type ServerMsg,
 } from "./protocol.ts";
@@ -90,6 +91,8 @@ class Sidecar {
     private readonly meter = new TickMeter();
     private deadlineMs: number;
     private dispatcher!: ActionDispatcher;
+    private sdk!: Sdk;
+    private bot!: Bot;
     private ready: ReadyMsg | null = null;
     private nextClientId = 1;
 
@@ -100,6 +103,8 @@ class Sidecar {
     /** The game tick the open (or last) cycle answered: at most one action per tick. */
     private lastCycleTick = -1;
     private awaitingRespawn = false;
+    /** A reset owns the bot: no cycle, no deadline, no state goes out until it lands. */
+    private resetting = false;
 
     /** Health counters, for the dashboard. */
     readonly health = { droppedStates: 0, brainOverrun: 0, opRejected: 0 };
@@ -127,6 +132,8 @@ class Sidecar {
             autoLaunchBrowser: false,
         });
         const bot = new BotActions(sdk);
+        this.sdk = sdk;
+        this.bot = bot;
         this.dispatcher = new ActionDispatcher(sdk);
         await login(sdk, bot, log);
 
@@ -190,10 +197,11 @@ class Sidecar {
             return;
         }
 
-        const cmdId = msg.t === "cmd" ? msg.cmdId : -1;
+        const cmdId = msg.t === "noop" ? -1 : msg.cmdId;
         if (socket.data.role !== "brain") {
             return this.ack(socket, cmdId, false, "role", 0, "observe clients cannot act");
         }
+        if (msg.t === "reset") return this.reset(socket, msg);
         // Stale-revision rejection: the brain answered a world that no longer exists.
         if (!this.cycle || this.cycle.revision !== msg.revision) {
             return this.ack(socket, cmdId, false, "stale", 0, `current revision ${this.cycle?.revision ?? "none"}`);
@@ -220,7 +228,46 @@ class Sidecar {
         this.ack(socket, msg.cmdId, outcome.ok, outcome.phase, outcome.opRejectedDelta, outcome.message);
     }
 
+    /**
+     * Walk to a fixed tile with the cycle suspended: the continuation policy
+     * would otherwise issue a walk every tick and fight `walkTo` for the bot.
+     */
+    private async reset(socket: ClientSocket, msg: ResetMsg): Promise<void> {
+        if (this.resetting) {
+            return this.ack(socket, msg.cmdId, false, "reset", 0, "a reset is already running");
+        }
+        this.resetting = true;
+        this.pending = null;
+        this.droppedSinceLast = 0;
+        this.closeCycle();
+        const started = Date.now();
+        let result: { success: boolean; message: string };
+        try {
+            result = await this.bot.walkTo(msg.x, msg.z, 1);
+        } catch (error) {
+            result = { success: false, message: error instanceof Error ? error.message : String(error) };
+        } finally {
+            this.resetting = false;
+        }
+        const player = this.sdk.getState()?.player;
+        log(
+            `reset -> (${msg.x}, ${msg.z}): ${result.success ? "ok" : "failed"} ${result.message} ` +
+                `in ${Date.now() - started} ms`,
+        );
+        this.send(socket, {
+            t: "ack",
+            cmdId: msg.cmdId,
+            ok: result.success,
+            phase: "reset",
+            opRejectedDelta: 0,
+            message: result.message,
+            x: player?.worldX ?? -1,
+            z: player?.worldZ ?? -1,
+        });
+    }
+
     private onState(sdk: Sdk, raw: Parameters<Parameters<Sdk["onStateUpdate"]>[0]>[0]): void {
+        if (this.resetting) return;
         if (raw.player?.isDead) {
             if (!this.awaitingRespawn) {
                 this.awaitingRespawn = true;
@@ -273,7 +320,9 @@ class Sidecar {
 
     /** The SDK republishes several times per game tick; the brain acts on the first of each. */
     private beginIfDue(): void {
-        if (this.cycle || !this.pending || this.pending.state.tick === this.lastCycleTick) return;
+        if (this.resetting || this.cycle || !this.pending || this.pending.state.tick === this.lastCycleTick) {
+            return;
+        }
         const observation = this.pending;
         this.pending = null;
         this.lastCycleTick = observation.state.tick;

@@ -134,7 +134,8 @@ export type AckPhase =
     | "dispatch"
     | "observation"
     | "completion"
-    | "continuation";
+    | "continuation"
+    | "reset";
 
 export interface AckMsg {
     t: "ack";
@@ -144,6 +145,9 @@ export interface AckMsg {
     /** Rise in `opFeedback.opRejectedCount` across the dispatch: > 0 means refused. */
     opRejectedDelta: number;
     message: string;
+    /** Where the player ended up. Only a `reset` ack carries it. */
+    x?: number;
+    z?: number;
 }
 
 export interface ErrorMsg {
@@ -171,7 +175,15 @@ export interface NoopMsg {
     revision: number;
 }
 
-export type ClientMsg = HelloMsg | CmdMsg | NoopMsg;
+/** Walk the player back to a fixed tile, outside the tick cycle. */
+export interface ResetMsg {
+    t: "reset";
+    cmdId: number;
+    x: number;
+    z: number;
+}
+
+export type ClientMsg = HelloMsg | CmdMsg | NoopMsg | ResetMsg;
 
 export function encode(msg: ServerMsg): string {
     return JSON.stringify(msg) + "\n";
@@ -194,6 +206,10 @@ export function parseClientMsg(line: string): ClientMsg | null {
         case "cmd":
             return typeof msg.cmdId === "number" && typeof msg.revision === "number" && isMotorAction(msg.action)
                 ? { t: "cmd", cmdId: msg.cmdId, revision: msg.revision, action: msg.action }
+                : null;
+        case "reset":
+            return typeof msg.cmdId === "number" && typeof msg.x === "number" && typeof msg.z === "number"
+                ? { t: "reset", cmdId: msg.cmdId, x: msg.x, z: msg.z }
                 : null;
         case "noop":
             return typeof msg.revision === "number" ? { t: "noop", revision: msg.revision } : null;

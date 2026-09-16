@@ -279,6 +279,9 @@ class Ack:
     phase: str
     op_rejected_delta: int
     message: str
+    #: Where the player ended up; only a `reset` ack carries it.
+    x: int | None = None
+    z: int | None = None
 
     @classmethod
     def from_dict(cls, d: Json) -> Ack:
@@ -288,6 +291,8 @@ class Ack:
             phase=d["phase"],
             op_rejected_delta=d["opRejectedDelta"],
             message=d["message"],
+            x=d.get("x"),
+            z=d.get("z"),
         )
 
 

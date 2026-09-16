@@ -18,6 +18,7 @@ from flybrain.loop.types import Npc, Player, StateUpdate, WorldState
 from tools import ablation
 from tools.ablation import (
     DEADLINE_FRACTION,
+    DEFAULT_START,
     SHUFFLE_ABSENT,
     SHUFFLE_BETTER,
     SHUFFLE_DEGENERATE,
@@ -41,6 +42,7 @@ from tools.ablation import (
     partial_json,
     record_episode,
     report,
+    reset_to_start,
     shuffle_verdict,
     tick_fields,
     to_json,
@@ -796,3 +798,98 @@ def test_with_the_hud_the_agent_records_spikes_into_it(monkeypatch):
         fake,
     )
     assert built[0]["spike_sink"] == fake.record_spikes
+
+
+# -------------------------------------------------------------------- resets
+
+
+class ResetClient:
+    """Answers a reset with a fixed outcome, recording what it was asked for."""
+
+    def __init__(self, ok: bool, landed: tuple[int, int]) -> None:
+        self.ok = ok
+        self.landed = landed
+        self.asked: tuple[int, int] | None = None
+
+    def send_reset(self, x: int, z: int) -> int:
+        self.asked = (x, z)
+        return 7
+
+    def wait_reset(self, cmd_id: int, timeout_s: float) -> tuple[bool, int, int]:
+        assert cmd_id == 7
+        return self.ok, *self.landed
+
+
+def test_every_episode_starts_from_the_same_tile():
+    client = ResetClient(True, DEFAULT_START)
+    assert reset_to_start(client, DEFAULT_START) == DEFAULT_START
+    assert client.asked == DEFAULT_START
+
+
+def test_a_failed_reset_is_a_dead_stack_not_a_scored_episode():
+    with pytest.raises(StackDown, match="failed"):
+        reset_to_start(ResetClient(False, (3300, 3190)), DEFAULT_START)
+
+
+def test_a_reset_that_lands_two_tiles_away_is_refused():
+    off = (DEFAULT_START[0] + 2, DEFAULT_START[1])
+    with pytest.raises(StackDown, match="more than a tile"):
+        reset_to_start(ResetClient(True, off), DEFAULT_START)
+
+
+def test_one_tile_of_walk_tolerance_is_accepted():
+    near = (DEFAULT_START[0] + 1, DEFAULT_START[1] - 1)
+    assert reset_to_start(ResetClient(True, near), DEFAULT_START) == near
+
+
+def test_a_stack_that_drops_during_the_reset_raises():
+    class Dropped(ResetClient):
+        def wait_reset(self, cmd_id, timeout_s):
+            raise ConnectionError("socket closed")
+
+    with pytest.raises(StackDown, match="dropped during the reset"):
+        reset_to_start(Dropped(True, DEFAULT_START), DEFAULT_START)
+
+
+def test_the_start_tile_is_configurable_and_can_be_turned_off():
+    args = build_parser().parse_args([])
+    assert tuple(args.start) == DEFAULT_START
+    assert not args.no_reset
+    assert (
+        Stack(
+            socket="s",
+            connectome_path="c",
+            collision_path="x",
+            calibration_path="k",
+            dry_run=False,
+            learn=False,
+            substeps=None,
+            start=(args.start[0], args.start[1]),
+        ).start
+        == DEFAULT_START
+    )
+
+    args = build_parser().parse_args(["--start", "3100", "3200", "--no-reset"])
+    assert tuple(args.start) == (3100, 3200)
+    assert args.no_reset
+    assert (
+        Stack(
+            socket="s",
+            connectome_path="c",
+            collision_path="x",
+            calibration_path="k",
+            dry_run=False,
+            learn=False,
+            substeps=None,
+            start=None if args.no_reset else (args.start[0], args.start[1]),
+        ).start
+        is None
+    )
+
+
+def test_the_report_says_where_every_episode_began():
+    per_condition, computed = scored([10.0] * 10)
+    assert "start              3222, 3218" in report(
+        per_condition, computed, meta(start=(3222, 3218))
+    )
+    assert "not reset" in report(per_condition, computed, meta())

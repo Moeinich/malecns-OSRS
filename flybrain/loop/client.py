@@ -113,6 +113,12 @@ class BridgeClient:
         )
         return self._cmd_id
 
+    def send_reset(self, x: int, z: int) -> int:
+        """Walk the bot back to a fixed tile, outside the tick cycle."""
+        self._cmd_id += 1
+        self._send({"t": "reset", "cmdId": self._cmd_id, "x": x, "z": z})
+        return self._cmd_id
+
     def send_noop(self, revision: int) -> None:
         self._note_deadline()
         self._send({"t": "noop", "revision": revision})
@@ -152,22 +158,46 @@ class BridgeClient:
             time.sleep(backoff)
             backoff = min(backoff * 2, self.backoff_max)
 
+    def wait_reset(self, cmd_id: int, timeout_s: float = 90.0) -> tuple[bool, int, int]:
+        """Block until the reset ack, returning (ok, x, z) from where it landed."""
+        if self._sock is None:
+            raise ConnectionError("not connected to the sidecar")
+        previous = self._sock.gettimeout()
+        self._sock.settimeout(timeout_s)
+        try:
+            while True:
+                line = self._read_line()
+                if line is None:
+                    raise ConnectionError("sidecar closed while waiting for the reset ack")
+                msg = self._apply(parse_server_message(_decode(line)))
+                if isinstance(msg, Ack) and msg.cmd_id == cmd_id and msg.phase == "reset":
+                    return (
+                        msg.ok,
+                        int(msg.x if msg.x is not None else -1),
+                        int(msg.z if msg.z is not None else -1),
+                    )
+        finally:
+            if self._sock is not None:
+                self._sock.settimeout(previous)
+
     def _messages(self) -> Iterator[ServerMessage]:
         """Every message until the sidecar closes; side effects applied here."""
         while True:
             line = self._read_line()
             if line is None:
                 return
-            msg = parse_server_message(_decode(line))
-            if isinstance(msg, Ready):
-                self.ready = msg
-            elif isinstance(msg, Reward):
-                self.last_reward = msg
-            elif isinstance(msg, Ack):
-                self.last_ack = msg
-            elif isinstance(msg, BridgeError):
-                raise ProtocolError(f"sidecar error: {msg.message}")
-            yield msg
+            yield self._apply(parse_server_message(_decode(line)))
+
+    def _apply(self, msg: ServerMessage) -> ServerMessage:
+        if isinstance(msg, Ready):
+            self.ready = msg
+        elif isinstance(msg, Reward):
+            self.last_reward = msg
+        elif isinstance(msg, Ack):
+            self.last_ack = msg
+        elif isinstance(msg, BridgeError):
+            raise ProtocolError(f"sidecar error: {msg.message}")
+        return msg
 
     def _read_line(self) -> bytes | None:
         """Buffer until a newline: a state message exceeds one `recv`, and a

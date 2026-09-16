@@ -264,3 +264,60 @@ def test_reconnects_after_server_closes(sidecar, client):
     assert next_state is not None
     assert next_state.revision == 2
     assert client.reconnects == 1
+
+
+def test_send_reset_and_wait_for_the_tile_it_landed_on(sidecar, client):
+    sidecar.recv_line()
+    cmd_id = client.send_reset(3222, 3218)
+    assert sidecar.recv_line() == {"t": "reset", "cmdId": cmd_id, "x": 3222, "z": 3218}
+
+    # A state in front of the ack must not be mistaken for it, and an ack for
+    # some other command must not end the wait either.
+    sidecar.send(state_msg(1))
+    sidecar.send(
+        {
+            "t": "ack",
+            "cmdId": cmd_id + 1,
+            "ok": True,
+            "phase": "completion",
+            "opRejectedDelta": 0,
+            "message": "other",
+        }
+    )
+    sidecar.send(
+        {
+            "t": "ack",
+            "cmdId": cmd_id,
+            "ok": True,
+            "phase": "reset",
+            "opRejectedDelta": 0,
+            "message": "Arrived",
+            "x": 3222,
+            "z": 3218,
+        }
+    )
+    assert client.wait_reset(cmd_id, timeout_s=5) == (True, 3222, 3218)
+
+    sidecar.send(state_msg(2))
+    assert next(client.states()).revision == 2
+
+
+def test_a_failed_reset_ack_carries_where_the_bot_actually_is(sidecar, client):
+    sidecar.recv_line()
+    cmd_id = client.send_reset(3222, 3218)
+    sidecar.recv_line()
+    sidecar.send(
+        {
+            "t": "ack",
+            "cmdId": cmd_id,
+            "ok": False,
+            "phase": "reset",
+            "opRejectedDelta": 0,
+            "message": "Pathfinding failed",
+            "x": 3300,
+            "z": 3190,
+        }
+    )
+    assert client.wait_reset(cmd_id, timeout_s=5) == (False, 3300, 3190)
+    assert client.last_ack is not None
+    assert client.last_ack.phase == "reset"
