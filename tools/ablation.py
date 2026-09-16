@@ -1041,16 +1041,27 @@ def hud_tick(
 
 def reset_to_start(client: BridgeClient, start: tuple[int, int]) -> tuple[int, int]:
     """Walk the bot back to `start`, or `StackDown`. Never scores a misplaced episode."""
-    try:
-        cmd_id = client.send_reset(*start)
-        ok, x, z = client.wait_reset(cmd_id, RESET_TIMEOUT_S)
-    except (ConnectionError, OSError, TimeoutError) as exc:
-        raise StackDown(f"the stack dropped during the reset to {start}: {exc}") from exc
-    if not ok:
-        raise StackDown(f"the reset to {start} failed; the bot is at ({x}, {z})")
-    if max(abs(x - start[0]), abs(z - start[1])) > 1:
-        raise StackDown(f"the reset to {start} landed at ({x}, {z}), more than a tile away")
-    return x, z
+
+    def attempt() -> tuple[int, int] | str:
+        try:
+            cmd_id = client.send_reset(*start)
+            ok, x, z = client.wait_reset(cmd_id, RESET_TIMEOUT_S)
+        except (ConnectionError, OSError, TimeoutError) as exc:
+            raise StackDown(f"the stack dropped during the reset to {start}: {exc}") from exc
+        if not ok:
+            return f"failed; the bot is at ({x}, {z})"
+        if max(abs(x - start[0]), abs(z - start[1])) > 1:
+            return f"landed at ({x}, {z}), more than a tile away"
+        return x, z
+
+    first = attempt()
+    if not isinstance(first, str):
+        return first
+    print(f"the reset to {start} {first}; retrying once", file=sys.stderr)
+    second = attempt()
+    if isinstance(second, str):
+        raise StackDown(f"the reset to {start} {first}, then {second}")
+    return second
 
 
 def run_condition(

@@ -965,6 +965,39 @@ def test_one_tile_of_walk_tolerance_is_accepted():
     assert reset_to_start(ResetClient(True, near), DEFAULT_START) == near
 
 
+class SequencedResetClient(ResetClient):
+    """Answers successive resets from a list of `(ok, (x, z))` outcomes."""
+
+    def __init__(self, outcomes: list[tuple[bool, tuple[int, int]]]) -> None:
+        super().__init__(*outcomes[0])
+        self.outcomes = outcomes
+        self.attempts = 0
+
+    def wait_reset(self, cmd_id, timeout_s):
+        ok, landed = self.outcomes[self.attempts]
+        self.attempts += 1
+        return ok, *landed
+
+
+def test_a_reset_that_fails_once_is_retried_rather_than_killing_the_run():
+    client = SequencedResetClient([(False, (3210, 3218)), (True, DEFAULT_START)])
+    assert reset_to_start(client, DEFAULT_START) == DEFAULT_START
+    assert client.attempts == 2
+
+
+def test_two_failed_resets_raise_naming_both():
+    client = SequencedResetClient([(False, (3210, 3218)), (False, (3300, 3190))])
+    with pytest.raises(StackDown, match=r"\(3210, 3218\).*then.*\(3300, 3190\)"):
+        reset_to_start(client, DEFAULT_START)
+
+
+def test_a_diagonal_neighbour_is_accepted_without_a_retry():
+    near = (DEFAULT_START[0] + 1, DEFAULT_START[1] + 1)
+    client = SequencedResetClient([(True, near)])
+    assert reset_to_start(client, DEFAULT_START) == near
+    assert client.attempts == 1
+
+
 def test_a_stack_that_drops_during_the_reset_raises():
     class Dropped(ResetClient):
         def wait_reset(self, cmd_id, timeout_s):

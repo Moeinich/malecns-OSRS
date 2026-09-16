@@ -45,6 +45,11 @@ const TICK_WINDOW = 21;
 /** A larger gap is a respawn or a stall, not a tick rate. */
 const TICK_MAX_GAP = 4;
 
+/** How long a reset waits for the SDK's player position to stop moving. */
+const SETTLE_MAX_MS = 1_500;
+const SETTLE_POLL_MS = 100;
+const SETTLE_STABLE_POLLS = 2;
+
 /**
  * The tick, measured rather than trusted.
  *
@@ -246,24 +251,56 @@ class Sidecar {
             result = await this.bot.walkTo(msg.x, msg.z, 1);
         } catch (error) {
             result = { success: false, message: error instanceof Error ? error.message : String(error) };
+        }
+        // The cycle stays closed through the settle: the brain is still waiting
+        // on this ack, so a deadline would fire the continuation policy and walk
+        // the bot off the tile it just reached. The SDK's own state keeps
+        // updating regardless, which is all the poll needs.
+        let settled: { x: number; z: number } | null = null;
+        try {
+            settled = await this.settledPosition();
         } finally {
             this.resetting = false;
         }
-        const player = this.sdk.getState()?.player;
+        // `walkTo` measures arrival in Euclidean distance, so a diagonal
+        // neighbour is 1.41 tiles away and fails a tolerance of 1. Chebyshev
+        // on the settled position is the truth the harness accepts.
+        const arrived =
+            settled !== null &&
+            Math.max(Math.abs(settled.x - msg.x), Math.abs(settled.z - msg.z)) <= 1;
         log(
-            `reset -> (${msg.x}, ${msg.z}): ${result.success ? "ok" : "failed"} ${result.message} ` +
-                `in ${Date.now() - started} ms`,
+            `reset -> (${msg.x}, ${msg.z}): ${arrived ? "ok" : "failed"} ${result.message} ` +
+                `settled at (${settled?.x ?? -1}, ${settled?.z ?? -1}) in ${Date.now() - started} ms`,
         );
         this.send(socket, {
             t: "ack",
             cmdId: msg.cmdId,
-            ok: result.success,
+            ok: arrived,
             phase: "reset",
             opRejectedDelta: 0,
             message: result.message,
-            x: player?.worldX ?? -1,
-            z: player?.worldZ ?? -1,
+            x: settled?.x ?? -1,
+            z: settled?.z ?? -1,
         });
+    }
+
+    /** Poll until the player position stops changing, or `SETTLE_MAX_MS` elapses. */
+    private async settledPosition(): Promise<{ x: number; z: number } | null> {
+        const deadline = Date.now() + SETTLE_MAX_MS;
+        let last: { x: number; z: number } | null = null;
+        let stable = 0;
+        while (Date.now() < deadline) {
+            const player = this.sdk.getState()?.player;
+            const here = player ? { x: player.worldX, z: player.worldZ } : null;
+            if (here && last && here.x === last.x && here.z === last.z) {
+                if (++stable >= SETTLE_STABLE_POLLS) return here;
+            } else {
+                stable = 0;
+            }
+            last = here;
+            await new Promise((resolve) => setTimeout(resolve, SETTLE_POLL_MS));
+        }
+        return last;
     }
 
     private onState(sdk: Sdk, raw: Parameters<Parameters<Sdk["onStateUpdate"]>[0]>[0]): void {
