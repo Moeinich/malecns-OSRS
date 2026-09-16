@@ -73,6 +73,10 @@ class Npc:
     reachable: bool
     options: tuple[str, ...]
 
+    @property
+    def attackable(self) -> bool:
+        return any(o.lower() == "attack" for o in self.options)
+
     @classmethod
     def from_dict(cls, d: Json) -> Npc:
         return cls(

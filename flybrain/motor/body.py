@@ -19,7 +19,6 @@ from flybrain.loop.types import (
     Eat,
     Flee,
     Idle,
-    Npc,
     PickupFovea,
     Walk,
     WorldState,
@@ -30,8 +29,6 @@ from flybrain.motor.decode import EgocentricCommand
 # subtended at the ~10 px radius where engagements happen. ~19 degrees.
 FOVEA_HALF_ANGLE = math.atan2(3.5, 10.0)
 FOVEA_RANGE_TILES = 20.0
-
-ATTACK_OPTION = "attack"
 
 FOOD_NAMES = frozenset(
     {
@@ -84,10 +81,6 @@ def _step(px: int, pz: int, bearing: float, tiles: float) -> tuple[int, int]:
     return round(px + tiles * math.cos(bearing)), round(pz + tiles * math.sin(bearing))
 
 
-def _is_attackable(npc: Npc) -> bool:
-    return any(o.lower() == ATTACK_OPTION for o in npc.options)
-
-
 def _is_food(name: str) -> bool:
     lowered = name.lower()
     return lowered in FOOD_NAMES or lowered.startswith("cooked ")
@@ -117,7 +110,7 @@ def to_action(
         return Flee(x=x, z=z)
 
     if cmd.attack:
-        attackable = [n for n in state.npcs if _is_attackable(n) and n.reachable]
+        attackable = [n for n in state.npcs if n.attackable and n.reachable]
         target = _nearest_in_fovea(attackable, px, pz, heading, params)
         return AttackFovea(npc_index=target.index) if target is not None else Idle()
 
