@@ -54,6 +54,7 @@ class LIFEngine:
         noise_pool: int = DEFAULT_NOISE_POOL,
         rate_window_ms: float = 500.0,
         plastic_idx: np.ndarray | None = None,
+        silenced: np.ndarray | None = None,
         seed: int | None = None,
     ) -> None:
         if not sp.isspmatrix_csc(W):
@@ -104,6 +105,9 @@ class LIFEngine:
         self._hist: deque[np.ndarray] = deque(maxlen=self._hist_len)
         self.steps = 0
 
+        self._silenced = np.empty(0, dtype=np.int64)
+        self.set_silenced(silenced)
+
         self._rng = np.random.default_rng(seed)
         self._noise_pool: np.ndarray | None = None
         self._noise_offset = 0
@@ -148,6 +152,8 @@ class LIFEngine:
         active = self.refractory == 0
         v_next = self.v_rest + (self.v - self.v_rest) * self.av + drive * self._one_minus_av
         self.v = np.where(active, v_next, self.v_reset).astype(np.float32, copy=False)
+        if self._silenced.size:
+            self.v[self._silenced] = self.v_rest
 
         fired = np.flatnonzero(active & (self.v >= self.v_thresh)).astype(np.int32)
 
@@ -162,6 +168,28 @@ class LIFEngine:
         self._record(fired)
         self.steps += 1
         return fired
+
+    @property
+    def silenced(self) -> np.ndarray:
+        """Indices removed from the simulation. Empty unless a lesion set them."""
+        return self._silenced
+
+    def set_silenced(self, idx: np.ndarray | None) -> None:
+        """Remove these neurons: pinned at rest, so they never reach threshold.
+
+        Nothing downstream of them is special-cased — a neuron that never fires
+        never deposits, never adapts and reads 0 Hz. Spikes they emitted before
+        this call still arrive: the delay ring holds summed current, not the
+        contribution of any one source, so those cannot be withdrawn.
+        """
+        self._silenced = (
+            np.empty(0, dtype=np.int64) if idx is None else np.asarray(idx, dtype=np.int64)
+        )
+        if self._silenced.size:
+            self.v[self._silenced] = self.v_rest
+            self.g[self._silenced] = 0.0
+            self.w[self._silenced] = 0.0
+            self.refractory[self._silenced] = 0
 
     def _deposit(self, fired: np.ndarray) -> None:
         starts = self._indptr[fired]

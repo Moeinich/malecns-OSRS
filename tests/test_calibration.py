@@ -149,6 +149,7 @@ def test_the_live_path_builds_its_engine_and_encoder_from_the_calibration(tmp_pa
 
     assert run_module.main(["--calibration", str(path), "--ticks", "0"]) == 0
 
+    assert seen["kwargs"].pop("silenced").size == 0  # no lesion asked for
     assert seen["kwargs"] == {
         "seed": 0,
         "dt_ms": 1.0,
@@ -187,6 +188,7 @@ def test_a_run_without_an_artifact_says_so_and_runs_raw(tmp_path, monkeypatch, c
     err = capsys.readouterr().err
     assert "UNCALIBRATED: running at gain 1.0, the brain will be silent" in err
     assert "calibration     UNCALIBRATED" in err
+    assert seen["kwargs"].pop("silenced").size == 0  # no lesion asked for
     assert seen["kwargs"] == {"seed": 0, "dt_ms": 1.0}
     np.testing.assert_array_equal(seen["W"].data, connectome.W.data)
 

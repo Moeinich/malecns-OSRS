@@ -104,7 +104,13 @@ def main(argv: list[str] | None = None) -> int:
     # Resolved against `W` — the matrix the engine is handed — because both the
     # ablation and the calibration returned new matrices on the way here.
     plastic = {"plastic_idx": kc_to_mbon(W, connectome)} if args.learn else {}
-    engine = LIFEngine(W, seed=args.seed, **plastic, **calibration.engine_kwargs())
+    engine = LIFEngine(
+        W,
+        seed=args.seed,
+        silenced=ablation.silenced(connectome),
+        **plastic,
+        **calibration.engine_kwargs(),
+    )
 
     reward, plasticity = _learning(connectome, engine, args.learn)
     # Imported only here: the brain must not depend on OpenCV being installed.

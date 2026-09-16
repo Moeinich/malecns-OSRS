@@ -413,6 +413,14 @@ class Ablation:
         parts += [f"lesion:{name}" for name in self.lesions]
         return "+".join(parts) if parts else "real"
 
+    def silenced(self, connectome: Connectome) -> np.ndarray:
+        """The neurons the engine must hold silent, alongside `apply`'s cut."""
+        if not self.lesions:
+            return np.empty(0, dtype=np.int64)
+        return np.unique(
+            np.concatenate([_population(connectome, n) for n in self.lesions]).astype(np.int64)
+        )
+
     def apply(self, connectome: Connectome) -> sp.csc_matrix:
         W = connectome.W.copy()
         if self.ablate_network:
@@ -437,13 +445,13 @@ def _population(connectome: Connectome, name: str) -> np.ndarray:
 
 
 def lesion(W: sp.csc_matrix, idx: np.ndarray) -> sp.csc_matrix:
-    """Silence a population: zero both its outgoing and its incoming weights.
+    """Cut a population's outgoing and incoming weights. Half of a lesion.
 
-    Outgoing alone would not be a lesion for any population we read out of. The
-    decoder measures DNp01's *firing rate*, which is driven by what DNp01
-    receives, so cutting only its axons would leave escape fully intact and the
-    double dissociation would be untestable. Cutting both is what removing the
-    cells actually does.
+    The other half is `Ablation.silenced`, handed to the engine. Cutting the
+    synapses alone leaves the cells firing: the calibrated tonic current reaches
+    every neuron at 0.9 of threshold and noise carries them over it, so a
+    population with its inhibition cut fires *more* — `lesion:DNp01` tripled
+    escape in a scored run. Removing the cells has to mean no spikes at all.
     """
     W = W.tocsc(copy=True)
     idx = np.asarray(idx, dtype=np.int64)

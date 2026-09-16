@@ -940,8 +940,11 @@ def build_agent(
     """The same wiring `flybrain.loop.run` builds, under one ablation."""
     connectome = load(stack.connectome_path)
     calibration = load_calibration(stack.calibration_path, connectome) or UNCALIBRATED
-    W = calibration.apply(ablation_for(condition, seed).apply(connectome))
-    engine = LIFEngine(W, seed=seed, **calibration.engine_kwargs())
+    ablation = ablation_for(condition, seed)
+    W = calibration.apply(ablation.apply(connectome))
+    engine = LIFEngine(
+        W, seed=seed, silenced=ablation.silenced(connectome), **calibration.engine_kwargs()
+    )
     reward = None
     try:
         reward = RewardRouter(DopamineIndex.from_connectome(connectome), connectome.n)

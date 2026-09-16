@@ -253,9 +253,10 @@ def _agent(sidecar: FakeSidecar, W: sp.csc_matrix, **params) -> Agent:
     connectome = _connectome()
     motor = MotorIndex.from_connectome(connectome, MotorParams())
     engine_cls = params.pop("engine_cls", LIFEngine)
+    engine_kwargs = params.pop("engine_kwargs", {})
     return Agent(
         client=BridgeClient(sidecar.path, reconnect=False),
-        engine=engine_cls(W, seed=1),
+        engine=engine_cls(W, seed=1, silenced=params.pop("silenced", None), **engine_kwargs),
         motor=motor,
         collision=_collision(),
         encoder=params.pop("encoder", _encoder),
@@ -274,6 +275,9 @@ def run_condition(
 ):
     connectome = _connectome()
     W = ablation.apply(connectome) if ablation is not None else connectome.W.copy()
+    # What `loop.run` and `tools.ablation` both build: the cut plus the silencing.
+    if ablation is not None and params.pop("silence", True):
+        params["silenced"] = ablation.silenced(connectome)
     # Not pytest's tmp_path: those paths overflow the 104-byte AF_UNIX limit.
     with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
         script = _script(n_ticks, tick_ms=tick_ms if state_tick_ms is None else state_tick_ms)
@@ -394,6 +398,22 @@ def test_lesion_silences_the_population_in_both_directions():
     assert not dense[idx, :].any()
     assert not dense[:, idx].any()
     assert dense.any(), "the lesion removed the rest of the network too"
+
+
+def test_a_lesion_silences_the_population_in_the_engine_not_only_the_synapses():
+    idx = _connectome().population("DNp01")
+    # The calibrated floor, at 0.9 of the 15 mV to threshold, plus noise over it.
+    driven = {
+        "tonic": np.full(N, 13.5, dtype=np.float32),
+        "engine_kwargs": {"spontaneous_noise_std": 60.0},
+    }
+    agent, reports, _ = run_condition(Ablation(lesions=("DNp01",)), n_ticks=4, **driven)
+    assert np.array_equal(agent.engine.silenced, idx)
+    assert [r.escape_spikes for r in reports] == [0, 0, 0, 0]
+
+    # The synapse cut alone is not a lesion: the tonic floor keeps them firing.
+    _, cut_only, _ = run_condition(Ablation(lesions=("DNp01",)), n_ticks=4, silence=False, **driven)
+    assert max(r.escape_spikes for r in cut_only) > 0
 
 
 def test_ablation_never_touches_the_connectomes_own_weights():

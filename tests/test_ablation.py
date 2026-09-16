@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from flybrain.app import ServiceFailed
@@ -199,6 +200,29 @@ class FakeConnectome:
 
     def population(self, name, side=None):
         return self.populations[name]
+
+
+class FakeOpticConnectome:
+    """Every type `lesion:optic` stands for, each its own block of cells."""
+
+    def __init__(self):
+        types = ablation_for("lesion:optic", 0).lesions
+        self.populations = {
+            t: np.arange(i * 10, i * 10 + 7, dtype=np.int64) for i, t in enumerate(types)
+        }
+        self.populations["DNp01"] = np.array([500, 501], dtype=np.int64)
+
+    def population(self, name, side=None):
+        return self.populations[name]
+
+
+def test_a_lesion_hands_the_engine_every_cell_it_removes():
+    c = FakeOpticConnectome()
+    optic = ablation_for("lesion:optic", 0)
+    expected = np.unique(np.concatenate([c.population(n) for n in optic.lesions]))
+    assert optic.silenced(c).tolist() == expected.tolist()
+    assert ablation_for("lesion:DNp01", 0).silenced(c).tolist() == [500, 501]
+    assert ablation_for("real", 0).silenced(c).size == 0
 
 
 def test_every_condition_is_resolved_before_any_episode_runs():
@@ -749,7 +773,10 @@ def _stub_build_agent(monkeypatch) -> list[dict]:
     for name, value in (
         ("load", lambda path: sentinel),
         ("load_calibration", lambda path, c=None: calibration),
-        ("ablation_for", lambda condition, seed: SimpleNamespace(apply=lambda c: None)),
+        (
+            "ablation_for",
+            lambda condition, seed: SimpleNamespace(apply=lambda c: None, silenced=lambda c: None),
+        ),
         ("LIFEngine", lambda w, **kw: None),
         ("MotorIndex", SimpleNamespace(from_connectome=lambda c: None)),
         ("CollisionGrid", SimpleNamespace(load=lambda p: None)),

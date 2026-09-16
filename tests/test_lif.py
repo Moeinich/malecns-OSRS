@@ -240,3 +240,46 @@ def test_the_noise_pool_hands_every_step_a_different_window():
 
     off = _engine(64, spontaneous_noise_std=0.0)
     assert off._noise_pool is None
+
+
+# --------------------------------------------------------------- silencing
+
+#: The steady state of the membrane update is `v_rest + drive`, so this is 0.9
+#: of the 15 mV to threshold — the floor the calibration puts under every
+#: neuron, and the reason cutting a population's synapses does not silence it.
+TONIC = 13.5
+
+
+def test_a_silenced_neuron_never_fires_under_tonic_drive_and_noise():
+    eng = _engine(3, silenced=np.array([1]), spontaneous_noise_std=60.0, seed=5)
+    fired = _run(eng, np.full(3, TONIC, dtype=np.float32), 2000)
+    counts = np.bincount(np.concatenate(fired), minlength=3)
+    assert counts[1] == 0
+    assert counts[0] > 0 and counts[2] > 0
+    assert eng.get_firing_rates()[1] == 0.0
+    assert eng.v[1] == pytest.approx(eng.v_rest)
+
+
+def test_a_silenced_neuron_deposits_nothing_downstream():
+    W = sp.csc_matrix(np.array([[0.0, 0.0], [40.0, 0.0]], dtype=np.float32))
+    eng = _engine(W=W, silenced=np.array([0]))
+    fired = _run(eng, np.array([60.0, 0.0], dtype=np.float32), 500)
+    assert not np.concatenate(fired).size
+    assert eng.v[1] == pytest.approx(eng.v_rest)
+
+
+def test_silencing_nothing_leaves_the_spike_train_untouched():
+    current = np.full(2, 20.0, dtype=np.float32)
+    plain = _run(_engine(2, seed=3), current, 300)
+    empty = _run(_engine(2, silenced=np.empty(0, dtype=np.int64), seed=3), current, 300)
+    assert [f.tolist() for f in plain] == [f.tolist() for f in empty]
+
+
+def test_silencing_after_the_fact_stops_a_firing_neuron():
+    eng = _engine(2, spontaneous_noise_std=60.0, seed=5)
+    current = np.full(2, 20.0, dtype=np.float32)
+    assert np.concatenate(_run(eng, current, 200)).size
+    eng.set_silenced(np.array([0]))
+    after = np.concatenate(_run(eng, current, 500))
+    assert 0 not in after
+    assert 1 in after
