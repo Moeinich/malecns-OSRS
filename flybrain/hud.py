@@ -108,12 +108,56 @@ _BRAIN_GROUPS: tuple[tuple[str, tuple[str, ...], tuple[int, int, int]], ...] = (
     ("mushroom body", ("KC", "MBON"), (120, 225, 140)),
     ("dopaminergic", ("PPL1", "PAM"), (110, 110, 250)),
     ("central complex", ("FB",), (230, 130, 225)),
-    # Only the DN types we name and read. The network holds 1,314 descending
-    # neurons; the rest are not separable from `populations` yet and fall into
-    # "unnamed", so labelling this "descending" would read as a brain with 14.
     ("named DNs", ("DNp01", "DNa02", "DNp09", "DNpe017", "MDN", "DNp20"), (245, 245, 250)),
 )
+#: Only reached when the annotations are absent and nothing can be classed.
 _BRAIN_OTHER = ("unnamed", (95, 95, 105))
+
+#: BGR per MaleCNS `superclass`. Muted on purpose: `_BRAIN_GROUPS` draws over
+#: this and the readout populations have to stay the brightest thing in the
+#: panel. Anything outside this table keeps its own label in `_SUPERCLASS_REST`.
+_SUPERCLASS_COLOURS: dict[str, tuple[int, int, int]] = {
+    "ol_intrinsic": (150, 105, 60),
+    "cb_intrinsic": (95, 150, 80),
+    "vnc_intrinsic": (110, 120, 170),
+    "visual_projection": (195, 160, 70),
+    "visual_centrifugal": (205, 200, 120),
+    "ascending_neuron": (80, 175, 175),
+    "descending_neuron": (70, 90, 220),
+    "vnc_motor": (180, 90, 180),
+    "cb_motor": (140, 60, 200),
+    "vnc_efferent": (60, 140, 200),
+    "cb_efferent": (160, 70, 170),
+    "efferent_ascending": (200, 120, 160),
+    "efferent_descending": (210, 140, 120),
+    "cb_endocrine": (120, 200, 230),
+    "vnc_endocrine": (170, 210, 160),
+    "ol_sensory": (90, 210, 110),
+    "cb_sensory": (110, 230, 90),
+    "vnc_sensory": (70, 200, 60),
+    "sensory_ascending": (140, 190, 90),
+    "sensory_descending": (150, 160, 110),
+    "ENS": (100, 100, 200),
+}
+_SUPERCLASS_REST = (125, 125, 130)
+_SUPERCLASS_NONE = ("unclassed", (95, 95, 105))
+
+
+def _superclass(
+    connectome_path: str | None, log: Callable[[str], None]
+) -> tuple[np.ndarray, tuple[str, ...]] | None:
+    """The superclass join, done here so no caller of `Hud.create` has to know."""
+    from flybrain.connectome import loader
+
+    try:
+        result = loader.superclasses(connectome_path or loader.DEFAULT_PATH)
+    except Exception as exc:  # noqa: BLE001 - colouring is decoration, never fatal
+        log(f"HUD: superclass colouring unavailable ({type(exc).__name__}: {exc}).")
+        return None
+    if result is None:
+        log("HUD: no annotations on disk; the connectome panel reads 'unclassed'.")
+    return result
+
 
 _RASTER_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("T4/T5", ("T4", "T5")),
@@ -191,8 +235,17 @@ class BrainCloud:
 
     @classmethod
     def build(
-        cls, positions: np.ndarray | None, populations: dict[str, np.ndarray]
+        cls,
+        positions: np.ndarray | None,
+        populations: dict[str, np.ndarray],
+        superclass: tuple[np.ndarray, tuple[str, ...]] | None = None,
     ) -> BrainCloud | None:
+        """Colour is anatomy, brightness is activity — `_with_glow` owns the latter.
+
+        Every neuron starts in its release `superclass`, so the cloud is fully
+        classed; the named readout families in `_BRAIN_GROUPS` are then painted
+        over the top, because those are the ones the loop actually reads.
+        """
         if positions is None:
             return None
         positions = np.asarray(positions, dtype=np.float32)
@@ -200,8 +253,22 @@ class BrainCloud:
         if not index.size:
             return None
 
-        group = np.zeros(len(positions), dtype=np.int8)
-        for g, (_label, members, _colour) in enumerate(_BRAIN_GROUPS, start=1):
+        if superclass is None:
+            slots = [_BRAIN_OTHER]
+            group = np.zeros(len(positions), dtype=np.int16)
+        else:
+            codes, sc_labels = superclass
+            slots = [_SUPERCLASS_NONE]
+            lut = np.zeros(len(sc_labels) + 1, dtype=np.int16)
+            for i, label in enumerate(sc_labels):
+                lut[i + 1] = len(slots)
+                slots.append((label, _SUPERCLASS_COLOURS.get(label, _SUPERCLASS_REST)))
+            group = lut[np.asarray(codes, dtype=np.int16) + 1]
+
+        families = {label for label, _m, _c in _BRAIN_GROUPS}
+        for label, members, colour in _BRAIN_GROUPS:
+            g = len(slots)
+            slots.append((label, colour))
             wanted = frozenset(members)
             for key, rows in populations.items():
                 if key.split(POPULATION_SEPARATOR, 1)[0] in wanted:
@@ -217,13 +284,13 @@ class BrainCloud:
         pts /= span
 
         group = group[index]
-        palette = np.array([_BRAIN_OTHER[1], *(c for _l, _m, c in _BRAIN_GROUPS)], dtype=np.float32)
-        labels = (_BRAIN_OTHER[0], *(label for label, _m, _c in _BRAIN_GROUPS))
-        legend = tuple(
-            (labels[g], tuple(int(v) for v in palette[g]), int((group == g).sum()))
-            for g in range(len(labels))
+        palette = np.array([c for _l, c in slots], dtype=np.float32)
+        rows_ = [
+            (slots[g][0], tuple(int(v) for v in palette[g]), int((group == g).sum()))
+            for g in range(len(slots))
             if (group == g).any()
-        )
+        ]
+        legend = tuple(sorted(rows_, key=lambda r: (r[0] in families, -r[2])))
         return cls(
             xyz=pts.astype(np.float32),
             half_width=float(max(half[0], half[1])),
@@ -531,7 +598,9 @@ def _draw_connectome(img: np.ndarray, snap: HudSnapshot) -> None:
         return
     x, y, w, h = rect
 
-    legend_h = 30
+    cols = 3 if len(cloud.legend) <= 6 else 4
+    lines = -(-len(cloud.legend) // cols)
+    legend_h = min(14 + lines * 13, h // 2)
     ph = h - legend_h
     ca, sa = math.cos(snap.phase), math.sin(snap.phase)
     p = cloud.xyz
@@ -569,10 +638,10 @@ def _draw_connectome(img: np.ndarray, snap: HudSnapshot) -> None:
     if activity is not None and float(np.max(activity, initial=0.0)) <= 0.0:
         _text(img, "SILENT - no neuron fired this tick", x + 6, y + ph - 6, _BAD, 0.4)
 
-    column = w // 3
+    column = w // cols
     for i, (label, colour, count) in enumerate(cloud.legend):
-        cx = x + (i % 3) * column
-        cy = y + ph + 10 + (i // 3) * 14
+        cx = x + (i % cols) * column
+        cy = y + ph + 10 + (i // cols) * 13
         cv2.rectangle(img, (cx, cy - 7), (cx + 8, cy + 1), colour, -1)
         _text(img, f"{label} {count:,}", cx + 13, cy, _DIM, 0.33)
 
@@ -940,6 +1009,8 @@ class Hud:
         populations: dict[str, np.ndarray] | None = None,
         n: int | None = None,
         soma_positions: np.ndarray | None = None,
+        superclass: tuple[np.ndarray, tuple[str, ...]] | None = None,
+        connectome_path: str | None = None,
         dt_ms: float = 1.0,
         probe: Callable[[str], None] = _probe_display,
         log: Callable[[str], None] = print,
@@ -956,7 +1027,9 @@ class Hud:
             groups = raster_groups(populations)
             if groups:
                 hud.raster = SpikeRaster(groups, n, dt_ms=dt_ms)
-            hud.brain = BrainCloud.build(soma_positions, populations)
+            if superclass is None:
+                superclass = _superclass(connectome_path, log)
+            hud.brain = BrainCloud.build(soma_positions, populations, superclass)
             if hud.brain is None:
                 log("HUD: no soma coordinates; the connectome panel reads 'no data'.")
         return hud

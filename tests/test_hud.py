@@ -338,6 +338,41 @@ def test_the_cloud_colours_by_named_population_not_by_index_range():
     assert len({colour for colour, _ in by_label.values()}) == len(by_label)
 
 
+def _superclass() -> tuple[np.ndarray, tuple[str, ...]]:
+    labels = ("cb_intrinsic", "descending_neuron", "ol_intrinsic")
+    codes = np.full(N_CELLS, 2, dtype=np.int16)
+    codes[1100:2400] = 0
+    codes[2400:2410] = 1
+    codes[3000:3020] = -1
+    return codes, labels
+
+
+def test_superclass_colouring_leaves_no_neuron_unnamed():
+    cloud = hud.BrainCloud.build(_soma_positions(), _populations(), _superclass())
+    assert cloud is not None
+    labels = [label for label, _c, _n in cloud.legend]
+    assert "unnamed" not in labels
+    assert "ol_intrinsic" in labels and "descending_neuron" in labels
+    assert sum(count for _l, _c, count in cloud.legend) == cloud.positioned
+
+
+def test_a_named_family_keeps_its_own_colour_over_its_superclass():
+    cloud = hud.BrainCloud.build(_soma_positions(), _populations(), _superclass())
+    assert cloud is not None
+    by_label = {label: (colour, count) for label, colour, count in cloud.legend}
+    assert by_label["named DNs"][1] == _expected("named DNs")
+    # DNa02 is a descending_neuron, and must not be counted as one here.
+    assert by_label["descending_neuron"][1] == len(set(range(2404, 2410)) - NO_SOMA)
+    dn = cloud.index.tolist().index(2400)
+    assert tuple(cloud.colour[dn]) == by_label["named DNs"][0]
+
+
+def test_an_unclassed_neuron_is_labelled_unclassed_not_unnamed():
+    cloud = hud.BrainCloud.build(_soma_positions(), _populations(), _superclass())
+    assert cloud is not None
+    assert {label: n for label, _c, n in cloud.legend}["unclassed"] > 0
+
+
 def test_a_missing_soma_array_is_no_data_rather_than_an_empty_brain():
     assert hud.BrainCloud.build(None, _populations()) is None
     assert hud.BrainCloud.build(np.full((4, 3), np.nan, np.float32), {}) is None

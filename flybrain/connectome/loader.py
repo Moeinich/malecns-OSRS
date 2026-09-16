@@ -14,13 +14,19 @@ every self-consistent test and is how an orientation bug survives.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import scipy.sparse as sp
+from pyarrow import feather
 
+from flybrain.connectome import vocab
 from flybrain.connectome.build import POPULATION_SEPARATOR
+
+log = logging.getLogger(__name__)
 
 DEFAULT_PATH = Path(__file__).resolve().parents[2] / "data" / "cache" / "connectome_v1.npz"
 
@@ -80,6 +86,10 @@ class Connectome:
     #: `float32[n, 3]` EM soma coordinates, NaN where the release annotates no
     #: soma. `None` only for a connectome that was not built from the release.
     soma_positions: np.ndarray | None = None
+    #: `int64[n]` row of each neuron in the body-annotations table, so any
+    #: column of the release can be joined back on at load time without a
+    #: rebuild. `None` for a connectome that was not built from the release.
+    annotation_rows: np.ndarray | None = None
 
     @property
     def n(self) -> int:
@@ -121,6 +131,7 @@ def load(path: Path | str = DEFAULT_PATH) -> Connectome:
             populations=populations,
             provenance=json.loads(str(data["provenance"])),
             soma_positions=data["soma_positions"],
+            annotation_rows=data["annotation_rows"],
         )
 
 
@@ -131,3 +142,39 @@ def load_csr(path: Path | str = DEFAULT_PATH) -> sp.csr_matrix:
             (data["csr_data"], data["csr_indices"], data["csr_indptr"]),
             shape=tuple(int(v) for v in data["shape"]),
         )
+
+
+def superclasses(
+    source: Connectome | Path | str = DEFAULT_PATH,
+    annotations_path: Path | str | None = None,
+) -> tuple[np.ndarray, tuple[str, ...]] | None:
+    """Each neuron's MaleCNS `superclass`, as `(int16[n] codes, labels)`.
+
+    A join against the annotations feather on `annotation_rows`, not a stored
+    column: the build artifact is fingerprinted by the calibration, so this may
+    never require a rebuild. `-1` marks a neuron the release leaves unclassed.
+
+    `None` when the annotations are not on disk — every caller is decoration
+    and must keep working on a machine that has only the artifact.
+    """
+    path = Path(annotations_path or vocab.DEFAULT_ANNOTATIONS_PATH)
+    if isinstance(source, Connectome):
+        rows = source.annotation_rows
+    else:
+        with np.load(Path(source), allow_pickle=False) as data:
+            rows = data["annotation_rows"] if "annotation_rows" in data.files else None
+    if rows is None:
+        log.info("no annotation_rows in this build; superclass unavailable")
+        return None
+    if not path.exists():
+        log.info("no annotations at %s; superclass unavailable", path)
+        return None
+
+    column = feather.read_table(path, columns=["superclass"]).column("superclass")
+    values = column.combine_chunks().take(pa.array(np.asarray(rows, dtype=np.int64))).to_pylist()
+    labels = tuple(sorted({v for v in values if v is not None}))
+    unknown = set(labels) - vocab.SUPERCLASSES
+    if unknown:
+        raise vocab.VocabDriftError(f"unknown superclass values: {sorted(unknown)}")
+    code = {label: i for i, label in enumerate(labels)}
+    return np.array([code.get(v, -1) for v in values], dtype=np.int16), labels
