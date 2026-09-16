@@ -77,25 +77,72 @@ async function publish(data: Buffer): Promise<void> {
     }
 }
 
-const cdp = await page.createCDPSession();
-cdp.on("Page.screencastFrame", (frame) => {
-    // Ack first and unconditionally, or Chrome stops sending.
-    void cdp.send("Page.screencastFrameAck", { sessionId: frame.sessionId }).catch(() => {});
-    rendered++;
-    const now = Date.now();
-    if (writing || now - lastWrite < MIN_FRAME_INTERVAL_MS) return;
-    lastWrite = now;
-    writing = true;
-    void publish(Buffer.from(frame.data, "base64")).finally(() => {
-        writing = false;
-    });
-});
-await cdp.send("Page.startScreencast", {
-    format: "jpeg",
+const SCREENCAST = {
+    format: "jpeg" as const,
     quality: 60,
     maxWidth: VIEWPORT.width,
     maxHeight: VIEWPORT.height,
-});
+};
+/** The client re-logs-in by itself; the screencast does not come back with it. */
+const STALL_MS = 15_000;
+
+type Cdp = Awaited<ReturnType<typeof page.createCDPSession>>;
+
+function attach(session: Cdp): void {
+    session.on("Page.screencastFrame", (frame) => {
+        // Ack first and unconditionally, or Chrome stops sending.
+        void session.send("Page.screencastFrameAck", { sessionId: frame.sessionId }).catch(() => {});
+        lastFrameAt = Date.now();
+        rendered++;
+        const now = Date.now();
+        if (writing || now - lastWrite < MIN_FRAME_INTERVAL_MS) return;
+        lastWrite = now;
+        writing = true;
+        void publish(Buffer.from(frame.data, "base64")).finally(() => {
+            writing = false;
+        });
+    });
+}
+
+let cdp = await page.createCDPSession();
+let lastFrameAt = Date.now();
+let announcedLoggedOut = false;
+attach(cdp);
+await cdp.send("Page.startScreencast", SCREENCAST);
+
+async function rearm(): Promise<void> {
+    const stalled = Date.now() - lastFrameAt;
+    if (stalled < STALL_MS) return;
+
+    let inGame = false;
+    try {
+        inGame = (await page.evaluate("window.gameClient?.ingame === true")) === true;
+    } catch {
+        // page busy or navigating; try again next interval
+    }
+    if (!inGame) {
+        if (!announcedLoggedOut) {
+            console.log("game-feed: page left the game; waiting");
+            announcedLoggedOut = true;
+        }
+        return;
+    }
+    announcedLoggedOut = false;
+
+    try {
+        await cdp.send("Page.stopScreencast").catch(() => {});
+        await cdp.send("Page.startScreencast", SCREENCAST);
+    } catch {
+        cdp = await page.createCDPSession();
+        attach(cdp);
+        await cdp.send("Page.startScreencast", SCREENCAST);
+        console.log("game-feed: CDP session was dead; reattached");
+    }
+    lastFrameAt = Date.now();
+    console.log(
+        `game-feed: screencast re-armed after ${(stalled / 1000).toFixed(0)} s without frames (page in game)`,
+    );
+}
 
 console.log(`game-feed: ready on ${framePath} for ${cfg.username}@${cfg.server}`);
 
@@ -125,4 +172,5 @@ setInterval(() => {
     console.log(`game-feed: ${fps.toFixed(1)} fps published, ${rendered} rendered`);
     rendered = 0;
     published = 0;
+    void rearm().catch((err) => console.error(`game-feed: re-arm failed: ${err}`));
 }, REPORT_EVERY_MS);
