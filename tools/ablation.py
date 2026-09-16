@@ -77,10 +77,13 @@ DEFAULT_CONDITIONS = (
 BASELINE = "real"
 DEFAULT_PRIMARY = "moving_fraction"
 
-#: The Lumbridge spawn tile every scored episode starts from. Without it each
-#: episode starts wherever the last one ended, and since conditions run in
-#: sequence, position drift is a confound on every contrast.
-DEFAULT_START = (3222, 3218)
+#: Where every scored episode starts. Without a fixed tile each episode began
+#: wherever the last one ended, and since conditions run in sequence, position
+#: drift was a confound on every contrast. The tile is a chicken spawn inside
+#: Fred's pen: region 50_51's NPC section places id 41 (chicken) at local
+#: (25-35, 33-36), i.e. x 3225-3235, z 3297-3300. The castle spawn (3222, 3218)
+#: is ~80 tiles south of any chicken, outside the retina's ~20-tile view.
+DEFAULT_START = (3230, 3298)
 
 #: How long a reset walk may take before the stack counts as down.
 RESET_TIMEOUT_S = 90.0
