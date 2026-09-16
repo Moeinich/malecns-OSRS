@@ -343,27 +343,75 @@ def test_a_missing_soma_array_is_no_data_rather_than_an_empty_brain():
     assert hud.BrainCloud.build(np.full((4, 3), np.nan, np.float32), {}) is None
 
 
-def test_a_silent_network_looks_dead_and_a_firing_one_does_not():
+def _drawn(h: hud.Hud, snap: hud.HudSnapshot, monkeypatch) -> np.ndarray:
+    """One `Hud.draw`, captured instead of shown. The baseline lives on the Hud."""
+    frames: list[np.ndarray] = []
+    monkeypatch.setattr(hud.cv2, "imshow", lambda _t, img: frames.append(img.copy()))
+    monkeypatch.setattr(hud.cv2, "waitKey", lambda _d: 0)
+    assert h.draw(snap) is True
+    return frames[-1]
+
+
+def _plot(frame: np.ndarray) -> np.ndarray:
+    """The projection only: no title, no legend chips, no SILENT marker."""
+    x, y, w, h = hud.PANELS["connectome"]
+    return frame[y + 40 : y + h - 60, x + 20 : x + w - 20].astype(np.int16)
+
+
+def test_a_silent_network_looks_dead_and_a_firing_one_does_not(monkeypatch):
     """The panel is lit by real firing, so 0.00 Hz must not render as pretty."""
     base = _full_snapshot()
     cloud = base.brain
-    x, y, w, h = hud.PANELS["connectome"]
 
     def lit(rate: float) -> float:
-        """Mean brightness above the panel ground, inside the projection only.
-
-        The margins are cut so the title, the legend chips and the SILENT
-        marker cannot stand in for neurons that are not firing.
-        """
+        h = hud.Hud()
         snap = dataclasses.replace(
             base, brain_activity=np.full(cloud.positioned, rate, dtype=np.float32)
         )
-        plot = hud.compose(snap)[y + 40 : y + h - 60, x + 20 : x + w - 20].astype(np.int16)
-        return float(np.clip(plot - 34, 0, None).mean())
+        _drawn(h, snap, monkeypatch)  # warm-up: the baseline starts at the rate
+        stepped = dataclasses.replace(
+            base, brain_activity=np.full(cloud.positioned, rate * 4.0, dtype=np.float32)
+        )
+        return float(np.clip(_plot(_drawn(h, stepped, monkeypatch)) - 34, 0, None).mean())
 
-    silent, firing = lit(0.0), lit(hud.ACTIVITY_REF_HZ)
+    silent, firing = lit(0.0), lit(1.0)
     assert silent < 1.0, "a network at 0.00 Hz must look dead, not decorative"
     assert firing > 5.0 * silent
+
+
+def test_a_flat_floor_does_not_glow(monkeypatch):
+    """The 1-5 Hz tonic floor is not a pulse; an unchanged network stays at the floor."""
+    base = _full_snapshot()
+    snap = dataclasses.replace(
+        base, brain_activity=np.full(base.brain.positioned, 4.57, dtype=np.float32)
+    )
+    h = hud.Hud()
+    warm = _plot(_drawn(h, snap, monkeypatch))
+    steady = _plot(_drawn(h, snap, monkeypatch))
+    floor = _plot(hud.compose(dataclasses.replace(snap, brain_activity=None)))
+    assert np.array_equal(warm, floor), "the first frame must not flash"
+    assert np.array_equal(steady, floor)
+
+
+def test_a_neuron_above_its_own_baseline_outshines_the_rest(monkeypatch):
+    base = _full_snapshot()
+    cloud = base.brain
+    rates = np.full(cloud.positioned, 4.0, dtype=np.float32)
+    h = hud.Hud()
+    flat = _plot(_drawn(h, dataclasses.replace(base, brain_activity=rates), monkeypatch))
+
+    stepped = rates.copy()
+    stepped[0] = 12.0
+    plot = _plot(_drawn(h, dataclasses.replace(base, brain_activity=stepped), monkeypatch))
+
+    brighter = np.argwhere(np.any(plot > flat, axis=2))
+    assert len(brighter) > 0, "the stepped neuron must light up"
+    assert np.all(plot >= flat), "no other neuron may dim because one fired"
+
+
+def test_the_reference_rate_is_gone():
+    """Brightness is a deviation now; a reader must not find an absolute scale."""
+    assert not hasattr(hud, "ACTIVITY_REF_HZ")
 
 
 def test_rotation_moves_the_connectome_and_nothing_else():
@@ -467,3 +515,32 @@ def test_the_label_is_right_aligned_and_clear_of_the_existing_strip_text():
     strip = hud.compose(snap)[:30]
     lit = np.argwhere(strip.any(axis=2))[:, 1]
     assert lit.max() >= hud.WIDTH - 20
+
+
+# ------------------------------------------------------------------- reflex
+
+
+def _reflex_bar(snap: hud.HudSnapshot) -> np.ndarray:
+    x, y, _w, h = hud.PANELS["dn"]
+    return hud.compose(snap)[y + h - 28 : y + h - 8, x + 8 : x + 8 + 230]
+
+
+def _escaping(escape: bool) -> hud.HudSnapshot:
+    base = _full_snapshot()
+    return dataclasses.replace(
+        base,
+        escape_spikes=3,
+        escape_substep=17,
+        command=dataclasses.replace(base.command, escape=escape),
+    )
+
+
+def test_spikes_without_a_burst_are_not_an_escape():
+    """DNp01 spikes in most ticks at the tonic floor; the decision is the burst."""
+    bar = _reflex_bar(_escaping(False))
+    assert not np.any(np.all(bar == hud._BAD, axis=2)), "spikes alone must not paint the alarm"
+    assert np.any(bar != _reflex_bar(dataclasses.replace(_escaping(False), escape_spikes=0)))
+
+
+def test_a_decided_escape_paints_the_bar():
+    assert np.any(np.all(_reflex_bar(_escaping(True)) == hud._BAD, axis=2))

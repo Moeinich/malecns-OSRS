@@ -87,10 +87,11 @@ _CHANNELS = (
     (CH_RESOURCE, "ch3 resources", (110, 220, 120)),
 )
 
-#: Firing rate that lights a soma fully. The target band's ceiling, so a
-#: network inside its band glows and a silent one stays at the floor.
-ACTIVITY_REF_HZ = 5.0
-#: Brightness of a neuron firing at 0 Hz. Low enough that silence reads as dead.
+#: How fast each neuron's own baseline follows its rate, per draw.
+_BRAIN_BASELINE_ALPHA = 0.1
+#: Deviations below this are noise, not a pulse; also guards a divide.
+_BRAIN_DEVIATION_EPS = 1e-3
+#: Brightness of a neuron at its own baseline. Low enough that silence reads as dead.
 _BRAIN_FLOOR = 0.13
 _BRAIN_FOCAL = 6.0
 _BRAIN_SPIN_PER_FRAME = 0.035
@@ -245,6 +246,10 @@ class HudSnapshot:
     brain: BrainCloud | None = None
     #: Per-point firing rate in Hz, aligned to `brain.index`.
     brain_activity: np.ndarray | None = None
+    #: Per-point brightness in 0..1: how far each rate sits above that
+    #: neuron's own baseline. `Hud.draw` fills it; a bare `compose` has no
+    #: history to measure against and draws the anatomy at the floor.
+    brain_glow: np.ndarray | None = None
     #: Rotation of the connectome about its vertical axis, radians.
     phase: float = 0.0
     n_neurons: int | None = None
@@ -515,7 +520,8 @@ def _draw_game(img: np.ndarray, snap: HudSnapshot) -> None:
 def _draw_connectome(img: np.ndarray, snap: HudSnapshot) -> None:
     cloud = snap.brain
     title = (
-        f"3D connectome - MaleCNS v1.0 real somas, {cloud.positioned:,} positioned"
+        f"3D connectome - {cloud.positioned:,} real somas, "
+        "bright = firing above that neuron's own baseline"
         if cloud is not None
         else "3D connectome - MaleCNS v1.0 real soma coordinates"
     )
@@ -540,11 +546,10 @@ def _draw_connectome(img: np.ndarray, snap: HudSnapshot) -> None:
     u = (x + w / 2 + across * persp * scale).astype(np.int32)
     v = (y + ph / 2 + p[:, 2] * persp * scale).astype(np.int32)
 
-    activity = snap.brain_activity
     glow = (
         np.zeros(len(p), dtype=np.float32)
-        if activity is None
-        else np.clip(np.asarray(activity, dtype=np.float32) / ACTIVITY_REF_HZ, 0.0, 1.0)
+        if snap.brain_glow is None
+        else np.clip(np.asarray(snap.brain_glow, dtype=np.float32), 0.0, 1.0)
     )
     shade = np.clip((persp - 0.7) / 0.6, 0.0, 1.0)
     weight = (_BRAIN_FLOOR + (1.0 - _BRAIN_FLOOR) * glow) * (0.35 + 0.65 * shade)
@@ -560,8 +565,8 @@ def _draw_connectome(img: np.ndarray, snap: HudSnapshot) -> None:
     patch = img[y : y + ph, x : x + w]
     np.maximum(patch, np.clip(tile, 0, 255).reshape(ph, w, 3).astype(np.uint8), out=patch)
 
-    peak = float(glow.max())
-    if peak <= 0.0:
+    activity = snap.brain_activity
+    if activity is not None and float(np.max(activity, initial=0.0)) <= 0.0:
         _text(img, "SILENT - no neuron fired this tick", x + 6, y + ph - 6, _BAD, 0.4)
 
     column = w // 3
@@ -768,10 +773,23 @@ def _draw_dn(img: np.ndarray, snap: HudSnapshot) -> None:
     spikes = snap.escape_spikes
     if spikes is None:
         _text(img, f"reflex counter: {NO_DATA}", x, y + h - 4, _DIM, 0.36)
-    elif spikes > 0:
+    elif snap.command is not None and snap.command.escape:
         cv2.rectangle(img, (x, y + h - 20), (x + 230, y + h - 2), _BAD, -1)
         at = _fmt(snap.escape_substep, "{:d}")
         _text(img, f"ESCAPE x{spikes} @ substep {at}", x + 6, y + h - 7, (255, 255, 255), 0.4)
+    elif spikes > 0 and snap.command is None:
+        _text(
+            img, f"DNp01 spikes this tick: {spikes} (decision: {NO_DATA})", x, y + h - 4, _DIM, 0.36
+        )
+    elif spikes > 0:
+        _text(
+            img,
+            f"DNp01 spikes this tick: {spikes} (below burst threshold)",
+            x,
+            y + h - 4,
+            _DIM,
+            0.36,
+        )
     else:
         _text(img, "reflex counter: 0 escape spikes this tick", x, y + h - 4, _DIM, 0.36)
 
@@ -908,6 +926,7 @@ class Hud:
     #: Drawn right-aligned in the top strip; None draws nothing.
     label: str | None = None
     render_ms: float | None = None
+    _baseline: np.ndarray | None = None
     _history: list[float] = field(default_factory=list)
     _last_draw: float = 0.0
     _phase: float = 0.0
@@ -960,7 +979,7 @@ class Hud:
             return False
         t0 = time.perf_counter()
         try:
-            cv2.imshow(self.title, compose(snap))
+            cv2.imshow(self.title, compose(self._with_glow(snap)))
             key = cv2.waitKey(1) & 0xFF
         except Exception as exc:  # noqa: BLE001 - telemetry may never take the brain down
             self.enabled = False
@@ -997,6 +1016,29 @@ class Hud:
         )
         return self.draw(dataclasses.replace(snap, rate_history=tuple(self._history)))
 
+    def _with_glow(self, snap: HudSnapshot) -> HudSnapshot:
+        """Brightness as each neuron's departure from its own recent rate.
+
+        Absolute rate cannot show a pulse: the network sits on a 1-5 Hz tonic
+        floor, so every soma would render near full. The scale is the spread of
+        the positive deviations in this very frame, never a fixed Hz.
+        """
+        rate = snap.brain_activity
+        if rate is None:
+            return snap
+        rate = np.asarray(rate, dtype=np.float32)
+        base = self._baseline
+        if base is None or base.shape != rate.shape:
+            self._baseline = rate.copy()
+            return dataclasses.replace(snap, brain_glow=np.zeros_like(rate))
+        deviation = rate - base
+        base += _BRAIN_BASELINE_ALPHA * deviation
+        positive = deviation[deviation > 0.0]
+        scale = max(
+            float(np.percentile(positive, 95)) if positive.size else 0.0, _BRAIN_DEVIATION_EPS
+        )
+        return dataclasses.replace(snap, brain_glow=np.clip(deviation / scale, 0.0, 1.0))
+
     def close(self) -> None:
         self.enabled = False
         try:
@@ -1007,7 +1049,6 @@ class Hud:
 
 
 __all__ = [
-    "ACTIVITY_REF_HZ",
     "HEIGHT",
     "NO_DATA",
     "PANELS",
