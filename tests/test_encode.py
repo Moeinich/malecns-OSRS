@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import time
 from itertools import pairwise
 from pathlib import Path
@@ -12,9 +13,11 @@ import scipy.sparse as sp
 from flybrain.connectome import vocab
 from flybrain.connectome.loader import DEFAULT_PATH, load
 from flybrain.engine.lif import LIFEngine
+from flybrain.loop.types import Npc, Player, WorldState
 from flybrain.sensory import encode as encode_mod
+from flybrain.sensory.collision import CollisionGrid
 from flybrain.sensory.encode import EncodeParams, encode, map_builds
-from flybrain.sensory.retina import CH_LUMINANCE, CH_THREAT, N_CHANNELS
+from flybrain.sensory.retina import CH_LUMINANCE, CH_THREAT, N_CHANNELS, Retina
 
 SIZE = 60
 
@@ -38,6 +41,68 @@ def _frame(x0: int = 0, x1: int = SIZE, value: float = 1.0, channel: int = CH_LU
 def _eyes(connectome, params: EncodeParams | None = None):
     inj = encode_mod._injection(SIZE, connectome, params or EncodeParams())
     return inj.eyes["L"], inj.eyes["R"]
+
+
+def _slabs(*eyes) -> np.ndarray:
+    return np.concatenate([s for eye in eyes for channel in eye.chromatic for s in channel])
+
+
+#: Straight ahead, and well outside the gaze wedge.
+AHEAD, ASIDE = 0.0, math.radians(60.0)
+
+
+def _scene(options: tuple[str, ...] | None = None, bearing: float = AHEAD) -> np.ndarray:
+    """One rendered sub-frame of open ground, optionally with one NPC 4 tiles out."""
+    collision = CollisionGrid(np.ones((101, 101), dtype=bool), x_min=0, z_min=0, level=0)
+    player = Player(
+        name="test",
+        combat_level=3,
+        hp=10,
+        max_hp=10,
+        x=50,
+        z=50,
+        level=0,
+        run_energy=100,
+        anim_id=-1,
+        in_combat=False,
+        target_index=-1,
+        target_type="none",
+        is_dead=False,
+        life_id=1,
+    )
+    npcs = ()
+    if options is not None:
+        npcs = (
+            Npc(
+                id=1,
+                index=1,
+                name="test-npc",
+                combat_level=1,
+                x=round(player.x + 4.0 * math.cos(bearing)),
+                z=round(player.z + 4.0 * math.sin(bearing)),
+                size=1,
+                distance=4,
+                hp=10,
+                max_hp=10,
+                in_combat=False,
+                target_index=-1,
+                reachable=True,
+                options=options,
+            ),
+        )
+    state = WorldState(
+        tick=0,
+        in_game=True,
+        modal_open=False,
+        player=player,
+        npcs=npcs,
+        ground_items=(),
+        locs=(),
+        inventory=(),
+        skills={},
+        op_rejected_count=0,
+    )
+    return Retina(SIZE).render_subframes(state, state, collision, 0.0, n=1, prev_heading=0.0)[0]
 
 
 # ------------------------------------------------------------------ firewall
@@ -114,7 +179,7 @@ def test_nothing_outside_the_sensory_indices_is_touched(connectome):
     out = encode(frame, connectome)
 
     left, right = _eyes(connectome)
-    sensory = np.concatenate([left.neurons, right.neurons, *left.chromatic, *right.chromatic])
+    sensory = np.concatenate([left.neurons, right.neurons, _slabs(left, right)])
     for name in ("DNa02", "DNp01", "MDN", "DNp09"):
         assert np.all(out[connectome.population(name)] == 0.0), name
 
@@ -160,15 +225,16 @@ def test_the_eyes_are_hemisphere_split_and_column_sized(connectome):
 @needs_artifacts
 def test_chromatic_channels_are_non_retinotopic_and_disjoint(connectome):
     left, _ = _eyes(connectome)
-    slabs = [set(s.tolist()) for s in left.chromatic]
+    slabs = [set(s.tolist()) for channel in left.chromatic for s in channel]
     for a, b in pairwise(slabs):
         assert a.isdisjoint(b)
     assert set(left.neurons.tolist()).isdisjoint(set().union(*slabs))
 
     out = encode(_frame(channel=CH_THREAT), connectome)
-    threat = out[left.chromatic[0]]
-    assert threat.max() > 0.0
-    assert np.all(threat == threat[0])  # one scalar per eye, no spatial structure
+    for zone in left.chromatic[0]:
+        threat = out[zone]
+        assert threat.max() > 0.0
+        assert np.all(threat == threat[0])  # one scalar per zone, no spatial structure
 
 
 # ------------------------------------------------------------ caching, timing
@@ -205,3 +271,51 @@ def test_encode_fits_in_the_tick_budget(connectome):
 def test_a_subframe_stack_is_rejected(connectome):
     with pytest.raises(ValueError):
         encode(np.zeros((4, SIZE, SIZE, N_CHANNELS), dtype=np.float32), connectome)
+
+
+# ------------------------------------------------------------------- prey
+
+
+@needs_artifacts
+def test_one_npc_drives_the_chromatic_path_within_reach_of_the_luminance_path(connectome):
+    """The whole-window mean put one NPC at 1.5e-4 and the injected current six
+    orders under the luminance drive, so not one spike time changed."""
+    left, right = _eyes(connectome)
+    out = encode(_scene(("Attack",)), connectome)
+    luminance = out[np.concatenate([left.neurons, right.neurons])].max()
+    chromatic = out[_slabs(left, right)].max()
+
+    print(f"\nchromatic/luminance peak current: {chromatic / luminance:.3f}")
+    assert chromatic >= 0.05 * luminance
+
+
+@needs_artifacts
+def test_prey_in_the_fovea_is_a_different_input_from_prey_off_to_the_side(connectome):
+    left, right = _eyes(connectome)
+    ahead = encode(_scene(("Attack",), AHEAD), connectome)
+    aside = encode(_scene(("Attack",), ASIDE), connectome)
+    assert not np.array_equal(ahead[_slabs(left, right)], aside[_slabs(left, right)])
+
+    fovea, periphery = left.chromatic[0]
+    assert ahead[fovea].max() > 0.0 and ahead[periphery].max() == 0.0
+    assert aside[periphery].max() > 0.0 and aside[fovea].max() == 0.0
+
+
+@needs_artifacts
+def test_a_talk_to_npc_is_invisible_to_the_chromatic_path(connectome):
+    """The retina paints only attackable NPCs; this pins that the encoder adds nothing."""
+    slabs = _slabs(*_eyes(connectome))
+    assert np.array_equal(
+        encode(_scene(("Talk-to",)), connectome)[slabs], encode(_scene(), connectome)[slabs]
+    )
+
+
+@needs_artifacts
+def test_the_luminance_path_never_sees_the_chromatic_channels(connectome):
+    """The calibration was measured on the luminance drive over an NPC-free walk,
+    so the operating point survives a chromatic change only while this holds."""
+    left, right = _eyes(connectome)
+    columns = np.concatenate([left.neurons, right.neurons])
+    empty, with_npc = _scene(), _scene(("Attack",))
+    assert np.array_equal(with_npc[:, :, CH_LUMINANCE], empty[:, :, CH_LUMINANCE])
+    assert np.array_equal(encode(empty, connectome)[columns], encode(with_npc, connectome)[columns])

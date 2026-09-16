@@ -21,6 +21,7 @@ actions exist — see AGENTS.md.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,7 +29,13 @@ import numpy as np
 
 from flybrain.connectome.loader import Connectome
 from flybrain.connectome.registry import CellTypeRegistry
-from flybrain.sensory.retina import CH_LOOT, CH_LUMINANCE, CH_RESOURCE, CH_THREAT
+from flybrain.sensory.retina import (
+    CH_LOOT,
+    CH_LUMINANCE,
+    CH_RESOURCE,
+    CH_THREAT,
+    DEFAULT_PX_PER_TILE,
+)
 
 #: Achromatic injection layer. L1/L2/L3/Tm1 are the plan's targets; Mi1 is the
 #: ON-pathway medulla cell sitting between L1 and T4 and is hex-mapped too.
@@ -38,6 +45,22 @@ LUMINANCE_TYPES = ("L1", "L2", "L3", "Tm1", "Mi1")
 CHROMATIC_CHANNELS = (CH_THREAT, CH_LOOT, CH_RESOURCE)
 
 SIDES = ("L", "R")
+
+#: The two zones each chromatic channel is reduced over, in slab order.
+ZONES = ("fovea", "periphery")
+
+#: Half-angle of the gaze wedge the body aims discrete acts through. Restated
+#: here rather than imported: `flybrain.sensory` may not see `flybrain.motor`,
+#: and `motor/body.py` derives the same number from this retina's geometry.
+FOVEA_HALF_ANGLE = math.atan2(3.5, 10.0)
+
+#: Pixels one tile covers. A channel's level is its painted mass over this, so a
+#: single tile-sized target reads as the intensity `retina._threat_intensity`
+#: painted it with (0.2-1.0) — which straddles `sigma`, the responsive part of
+#: the Naka-Rushton curve. Averaging over the whole ~1,800 px window instead put
+#: one NPC at 1.5e-4, six orders under the luminance drive and under the noise
+#: floor, so no spike time changed and the channel carried nothing.
+TILE_AREA_PX = DEFAULT_PX_PER_TILE**2
 
 
 @dataclass(frozen=True)
@@ -82,8 +105,10 @@ class _Eye:
     #: Network indices of the column cells, and the column each belongs to.
     neurons: np.ndarray
     column_of: np.ndarray
-    #: One disjoint slab of non-retinotopic cells per chromatic channel.
-    chromatic: tuple[np.ndarray, ...]
+    #: Pixels of this eye's window inside the gaze wedge, and the rest.
+    zones: tuple[np.ndarray, ...]
+    #: One disjoint slab of non-retinotopic cells per chromatic channel per zone.
+    chromatic: tuple[tuple[np.ndarray, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -126,10 +151,12 @@ def encode(
         out[eye.neurons] = drive[eye.column_of]
 
         window = raster[:, eye.x0 : eye.x1, :]
-        for slab, channel in zip(eye.chromatic, CHROMATIC_CHANNELS, strict=True):
-            level = float(window[:, :, channel].mean())
+        for slabs, channel in zip(eye.chromatic, CHROMATIC_CHANNELS, strict=True):
+            painted = window[:, :, channel]
             gain = params.i_max * params.chromatic_gain(channel)
-            out[slab] = gain * _naka_rushton(level, params)
+            for slab, zone in zip(slabs, eye.zones, strict=True):
+                level = float(painted[zone].sum()) / TILE_AREA_PX
+                out[slab] = gain * _naka_rushton(level, params)
     return out
 
 
@@ -213,6 +240,10 @@ def _build_eye(
     counts = np.bincount(labels, minlength=len(keys))
     starved = np.flatnonzero(counts == 0)
 
+    centre = (size - 1) / 2.0
+    ahead = centre - rows_i  # raster row 0 is straight ahead
+    fovea = (ahead > 0) & (np.abs(cols_i - centre) <= ahead * np.tan(FOVEA_HALF_ANGLE))
+
     return _Eye(
         x0=x0,
         x1=x1,
@@ -223,6 +254,7 @@ def _build_eye(
         starved_pixel=pixels[distance[:, starved].argmin(axis=0)],
         neurons=np.array([i for cells in members for i in cells], dtype=np.int64),
         column_of=np.repeat(np.arange(len(keys)), [len(c) for c in members]),
+        zones=(fovea, ~fovea),
         chromatic=(),
     )
 
@@ -233,11 +265,14 @@ def _unit(values: np.ndarray) -> np.ndarray:
 
 
 def _with_chromatic(eye: _Eye, unplaced: np.ndarray, offset: int) -> _Eye:
-    """Split the unplaceable cells into per-side, per-channel disjoint slabs."""
-    n_slabs = len(SIDES) * len(CHROMATIC_CHANNELS)
-    parts = np.array_split(unplaced, n_slabs)
-    base = offset * len(CHROMATIC_CHANNELS)
-    chromatic = tuple(parts[base + k] for k in range(len(CHROMATIC_CHANNELS)))
+    """Split the unplaceable cells into per-side, per-channel, per-zone slabs."""
+    per_side = len(CHROMATIC_CHANNELS) * len(ZONES)
+    parts = np.array_split(unplaced, len(SIDES) * per_side)
+    base = offset * per_side
+    chromatic = tuple(
+        tuple(parts[base + k * len(ZONES) + z] for z in range(len(ZONES)))
+        for k in range(len(CHROMATIC_CHANNELS))
+    )
     return _Eye(
         x0=eye.x0,
         x1=eye.x1,
@@ -248,6 +283,7 @@ def _with_chromatic(eye: _Eye, unplaced: np.ndarray, offset: int) -> _Eye:
         starved_pixel=eye.starved_pixel,
         neurons=eye.neurons,
         column_of=eye.column_of,
+        zones=eye.zones,
         chromatic=chromatic,
     )
 
