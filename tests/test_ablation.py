@@ -10,10 +10,12 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+from types import SimpleNamespace
 
 import pytest
 
 from flybrain.loop.types import Npc, Player, StateUpdate, WorldState
+from tools import ablation
 from tools.ablation import (
     DEADLINE_FRACTION,
     SHUFFLE_ABSENT,
@@ -23,14 +25,18 @@ from tools.ablation import (
     SHUFFLE_MATCHED,
     Episode,
     RunMeta,
+    Stack,
     StackDown,
     TickRecord,
     ablation_for,
     alive_states,
+    build_agent,
+    build_parser,
     compare,
     connect,
     effects,
     hedges_g,
+    hud_tick,
     metrics,
     partial_json,
     record_episode,
@@ -661,3 +667,132 @@ def test_the_zero_kills_clause_is_conditional_on_the_measured_kills():
     text = report(killing, effects(killing, seed=0, reps=200), m)
     assert "Zero kills in every condition" not in text
     assert "real 12/hr" in text
+
+
+# ------------------------------------------------------------------------ hud
+
+
+class FakeHud:
+    """Everything `run_condition` asks of a hud, and nothing more."""
+
+    enabled = True
+
+    def __init__(self) -> None:
+        self.label = None
+        self.game_frame = None
+        self.calls = []
+
+    def record_spikes(self, fired) -> None:
+        pass
+
+    def update(self, agent, report) -> None:
+        self.calls.append((agent, report, self.label))
+
+    def close(self) -> None:
+        pass
+
+
+def test_the_hud_flag_reaches_the_stack_the_meta_and_the_report():
+    args = build_parser().parse_args(["--hud"])
+    assert args.hud
+    assert Stack(
+        socket="s",
+        connectome_path="c",
+        collision_path="x",
+        calibration_path="k",
+        dry_run=False,
+        learn=False,
+        substeps=None,
+        hud=args.hud,
+    ).hud
+
+    per_condition, computed = full_run()
+    assert "hud                on" in report(per_condition, computed, meta(hud=True))
+    assert "hud                off" in report(per_condition, computed, meta())
+
+
+def test_the_hud_driver_draws_every_tick_and_scores_the_report_unchanged():
+    reports = [object(), object(), object()]
+    agent = SimpleNamespace(tick=lambda update: reports.pop(0))
+    fake = FakeHud()
+    tick = hud_tick(agent, fake, None, "shuffle", 2, 5, 3)
+
+    returned = [tick(None) for _ in range(3)]
+    assert len(fake.calls) == 3
+    assert [r for _a, r, _l in fake.calls] == returned
+    assert all(a is agent for a, _r, _l in fake.calls)
+    labels = [label for _a, _r, label in fake.calls]
+    assert labels == [
+        "ablation - shuffle - episode 2/5 - tick 1/3",
+        "ablation - shuffle - episode 2/5 - tick 2/3",
+        "ablation - shuffle - episode 2/5 - tick 3/3",
+    ]
+
+
+def _stub_build_agent(monkeypatch) -> list[dict]:
+    """Strip `build_agent` down to the one wiring decision under test."""
+    built: list[dict] = []
+    sentinel = SimpleNamespace(
+        populations={}, soma_positions=None, n=4, connectome_path=None, W=None
+    )
+    calibration = SimpleNamespace(
+        apply=lambda w: w,
+        engine_kwargs=dict,
+        encode_params=lambda: None,
+        tonic_drive=lambda n: None,
+    )
+    for name, value in (
+        ("load", lambda path: sentinel),
+        ("load_calibration", lambda path, c=None: calibration),
+        ("ablation_for", lambda condition, seed: SimpleNamespace(apply=lambda c: None)),
+        ("LIFEngine", lambda w, **kw: None),
+        ("MotorIndex", SimpleNamespace(from_connectome=lambda c: None)),
+        ("CollisionGrid", SimpleNamespace(load=lambda p: None)),
+        ("default_encoder", lambda c, p: None),
+        ("DopamineIndex", SimpleNamespace(from_connectome=lambda c: None)),
+        ("RewardRouter", lambda idx, n: None),
+        ("Agent", lambda **kw: built.append(kw)),
+    ):
+        monkeypatch.setattr(ablation, name, value)
+    return built
+
+
+def test_without_the_hud_the_agent_gets_no_spike_sink(monkeypatch):
+    built = _stub_build_agent(monkeypatch)
+    build_agent(
+        Stack(
+            socket="s",
+            connectome_path="c",
+            collision_path="x",
+            calibration_path="k",
+            dry_run=False,
+            learn=False,
+            substeps=None,
+        ),
+        "real",
+        0,
+        None,
+    )
+    assert built[0]["spike_sink"] is None
+
+
+def test_with_the_hud_the_agent_records_spikes_into_it(monkeypatch):
+    built = _stub_build_agent(monkeypatch)
+    fake = FakeHud()
+    build_agent(
+        Stack(
+            socket="s",
+            connectome_path="c",
+            collision_path="x",
+            calibration_path="k",
+            dry_run=False,
+            learn=False,
+            substeps=None,
+            hud=True,
+        ),
+        "real",
+        0,
+        None,
+        fake,
+    )
+    assert built[0]["spike_sink"] == fake.record_spikes

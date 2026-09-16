@@ -25,7 +25,7 @@ import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
-from itertools import pairwise
+from itertools import count, pairwise
 from pathlib import Path
 from typing import Any
 
@@ -608,6 +608,7 @@ class RunMeta:
     started: str
     configured_tick_ms: int | None = None
     observed_tick_ms: float | None = None
+    hud: bool = False
 
 
 def _tick_mismatch(meta: RunMeta) -> list[str]:
@@ -721,6 +722,7 @@ def report(
             f"mode               {'dry-run (no commands sent)' if meta.dry_run else 'live'}, "
             f"learning {'ON' if meta.learn else 'OFF (weights frozen)'}"
         ),
+        f"hud                {'on' if meta.hud else 'off'}",
         "",
         "-- means per condition " + "-" * 55,
     ]
@@ -832,6 +834,7 @@ class Stack:
     dry_run: bool
     learn: bool
     substeps: int | None
+    hud: bool = False
 
 
 def connect(socket_path: str, timeout: float = 30.0) -> BridgeClient:
@@ -871,7 +874,9 @@ def alive_states(client: BridgeClient, timeout: float = 120.0) -> Iterator[State
         raise StackDown(f"the stack dropped mid-episode: {exc}") from exc
 
 
-def build_agent(stack: Stack, condition: str, seed: int, client: BridgeClient) -> Agent:
+def build_agent(
+    stack: Stack, condition: str, seed: int, client: BridgeClient, hud: Any = None
+) -> Agent:
     """The same wiring `flybrain.loop.run` builds, under one ablation."""
     connectome = load(stack.connectome_path)
     calibration = load_calibration(stack.calibration_path, connectome) or UNCALIBRATED
@@ -891,22 +896,53 @@ def build_agent(stack: Stack, condition: str, seed: int, client: BridgeClient) -
         params=AgentParams(substeps_per_subframe=stack.substeps, dry_run=stack.dry_run),
         tonic=calibration.tonic_drive(connectome.n),
         calibration=calibration,
+        spike_sink=hud.record_spikes if hud is not None and hud.enabled else None,
         reward=reward,
     )
 
 
+def hud_tick(
+    agent: Agent, hud: Any, feed: Any, condition: str, episode: int, episodes: int, ticks: int
+) -> Callable[[StateUpdate], Any]:
+    """`agent.tick` with the window drawn after it, scoring the same report."""
+    counter = count(1)
+
+    def tick(update: StateUpdate) -> Any:
+        report = agent.tick(update)
+        hud.label = (
+            f"ablation - {condition} - episode {episode}/{episodes} - tick {next(counter)}/{ticks}"
+        )
+        if feed is not None and hud.should_draw(report.overrun):
+            hud.game_frame = feed.read()
+        hud.update(agent, report)
+        return report
+
+    return tick
+
+
 def run_condition(
-    stack: Stack, condition: str, episodes: int, ticks: int, seed: int
+    stack: Stack,
+    condition: str,
+    episodes: int,
+    ticks: int,
+    seed: int,
+    hud: Any = None,
+    feed: Any = None,
 ) -> list[Episode]:
     out = []
     for i in range(episodes):
         episode_seed = seed + i
         client = connect(stack.socket)
         try:
-            agent = build_agent(stack, condition, episode_seed, client)
+            agent = build_agent(stack, condition, episode_seed, client, hud)
+            driver = (
+                agent.tick
+                if hud is None
+                else hud_tick(agent, hud, feed, condition, i + 1, episodes, ticks)
+            )
             episode = record_episode(
                 alive_states(client),
-                agent.tick,
+                driver,
                 condition=condition,
                 seed=episode_seed,
                 ticks=ticks,
@@ -945,6 +981,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--substeps", type=int, default=None)
     p.add_argument("--dry-run", action="store_true", help="score the brain without moving the bot")
     p.add_argument("--out", default=None, help="write the JSON report here")
+    p.add_argument(
+        "--hud",
+        action="store_true",
+        help="live OpenCV telemetry window; q closes it, the run continues",
+    )
     return p
 
 
@@ -965,8 +1006,10 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         learn=False,
         substeps=args.substeps,
+        hud=args.hud,
     )
-    validate_conditions(args.conditions, load(args.connectome), args.seed)
+    connectome = load(args.connectome)
+    validate_conditions(args.conditions, connectome, args.seed)
 
     calibration = load_calibration(args.calibration) or UNCALIBRATED
     meta = RunMeta(
@@ -980,18 +1023,39 @@ def main(argv: list[str] | None = None) -> int:
         calibration=calibration.describe(),
         calibration_params=calibration_params(calibration),
         started=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        hud=args.hud,
     )
+
+    hud = feed = None
+    if args.hud:
+        # Imported only here: the brain must not depend on OpenCV being installed.
+        from flybrain.gamefeed import GameFeed
+        from flybrain.hud import Hud
+
+        feed = GameFeed()
+        hud = Hud.create(
+            populations=connectome.populations,
+            soma_positions=connectome.soma_positions,
+            n=connectome.n,
+            dt_ms=calibration.engine_kwargs().get("dt_ms", 1.0),
+            min_interval=1 / 6,
+            log=lambda m: print(m, file=sys.stderr),
+        )
 
     out_path = Path(args.out) if args.out else None
     per_condition: dict[str, list[dict[str, float]]] = {}
-    for condition in args.conditions:
-        print(f"condition {condition}", file=sys.stderr)
-        runs = run_condition(stack, condition, args.episodes, args.ticks, args.seed)
-        meta = replace(meta, **tick_fields(runs))
-        per_condition[condition] = [metrics(e) for e in runs]
-        if out_path:
-            write_json(out_path, partial_json(per_condition, meta))
-            print(f"wrote {len(per_condition)} condition(s) to {out_path}", file=sys.stderr)
+    try:
+        for condition in args.conditions:
+            print(f"condition {condition}", file=sys.stderr)
+            runs = run_condition(stack, condition, args.episodes, args.ticks, args.seed, hud, feed)
+            meta = replace(meta, **tick_fields(runs))
+            per_condition[condition] = [metrics(e) for e in runs]
+            if out_path:
+                write_json(out_path, partial_json(per_condition, meta))
+                print(f"wrote {len(per_condition)} condition(s) to {out_path}", file=sys.stderr)
+    finally:
+        if hud is not None:
+            hud.close()
 
     computed = effects(per_condition, seed=args.seed)
     print(report(per_condition, computed, meta))

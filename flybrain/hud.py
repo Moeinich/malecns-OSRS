@@ -275,6 +275,7 @@ class HudSnapshot:
     render_ms: float | None = None
     tick: int | None = None
     revision: int | None = None
+    label: str | None = None
 
 
 def snapshot_from_agent(
@@ -287,6 +288,7 @@ def snapshot_from_agent(
     game: np.ndarray | None = None,
     phase: float = 0.0,
     fps: float | None = None,
+    label: str | None = None,
 ) -> HudSnapshot:
     """Read the agent's own state into a frame description. Draws nothing."""
     motor = agent.motor
@@ -349,6 +351,7 @@ def snapshot_from_agent(
         render_ms=render_ms,
         tick=report.tick,
         revision=report.revision,
+        label=label,
     )
 
 
@@ -486,6 +489,9 @@ def _draw_status(img: np.ndarray, snap: HudSnapshot) -> None:
         _TEXT,
         0.44,
     )
+    if snap.label:
+        (tw, _), _ = cv2.getTextSize(snap.label, _FONT, 0.44, 1)
+        _text(img, snap.label, WIDTH - 10 - tw, 23, _TEXT, 0.44)
 
 
 def _draw_game(img: np.ndarray, snap: HudSnapshot) -> None:
@@ -899,6 +905,8 @@ class Hud:
     #: Set by whatever owns a browser client; drawn as-is next frame. Nothing
     #: here fetches it, so a missing client is a placeholder, not a stall.
     game_frame: np.ndarray | None = None
+    #: Drawn right-aligned in the top strip; None draws nothing.
+    label: str | None = None
     render_ms: float | None = None
     _history: list[float] = field(default_factory=list)
     _last_draw: float = 0.0
@@ -985,6 +993,7 @@ class Hud:
             game=self.game_frame,
             phase=self._phase,
             fps=self._fps,
+            label=self.label,
         )
         return self.draw(dataclasses.replace(snap, rate_history=tuple(self._history)))
 

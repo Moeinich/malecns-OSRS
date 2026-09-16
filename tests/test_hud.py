@@ -447,3 +447,23 @@ def test_the_health_panel_shows_the_sidecar_deadline_not_the_tick():
     panel = hud.compose(snap)[y : y + h, x : x + w]
     wrong = hud.compose(dataclasses.replace(snap, deadline_ms=600.0))[y : y + h, x : x + w]
     assert np.any(panel != wrong), "the deadline must be visible in the health panel"
+
+
+def test_the_label_draws_in_the_strip_and_nowhere_else():
+    base = _full_snapshot()
+    labelled = hud.compose(dataclasses.replace(base, label="ablation - shuffle - tick 7/20"))
+    plain = hud.compose(base)
+    assert not np.array_equal(labelled[:30], plain[:30])
+    assert np.array_equal(labelled[30:], plain[30:])
+
+
+def test_no_label_renders_exactly_as_before():
+    base = _full_snapshot()
+    assert np.array_equal(hud.compose(dataclasses.replace(base, label=None)), hud.compose(base))
+
+
+def test_the_label_is_right_aligned_and_clear_of_the_existing_strip_text():
+    snap = dataclasses.replace(_full_snapshot(), label="x" * 40)
+    strip = hud.compose(snap)[:30]
+    lit = np.argwhere(strip.any(axis=2))[:, 1]
+    assert lit.max() >= hud.WIDTH - 20
