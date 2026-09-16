@@ -56,9 +56,15 @@ RESOURCE_OPTIONS = frozenset(
     }
 )
 
+ATTACK_OPTION = "attack"
+
 
 def _is_resource(loc: Loc) -> bool:
     return any(o.lower() in RESOURCE_OPTIONS for o in loc.options)
+
+
+def _is_attackable(npc: Npc) -> bool:
+    return any(o.lower() == ATTACK_OPTION for o in npc.options)
 
 
 def _threat_intensity(npc: Npc, player: Player | None) -> float:
@@ -168,6 +174,10 @@ class Retina:
 
         prev_npcs = {n.index: n for n in prev_state.npcs}
         for npc in state.npcs:
+            # An NPC with no Attack option is scenery: the engine refuses the act
+            # silently, so painting it teaches the fly a move that never lands.
+            if not _is_attackable(npc):
+                continue
             was = prev_npcs.get(npc.index)
             nx = _lerp(was.x, npc.x, t) if was is not None else float(npc.x)
             nz = _lerp(was.z, npc.z, t) if was is not None else float(npc.z)

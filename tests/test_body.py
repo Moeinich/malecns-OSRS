@@ -55,7 +55,13 @@ def _player(x: int = 100, z: int = 100) -> Player:
     )
 
 
-def _npc(index: int, x: int, z: int) -> Npc:
+def _npc(
+    index: int,
+    x: int,
+    z: int,
+    options: tuple[str, ...] = ("Attack",),
+    reachable: bool = True,
+) -> Npc:
     return Npc(
         id=1,
         index=index,
@@ -69,8 +75,8 @@ def _npc(index: int, x: int, z: int) -> Npc:
         max_hp=3,
         in_combat=False,
         target_index=-1,
-        reachable=True,
-        options=("Attack",),
+        reachable=reachable,
+        options=options,
     )
 
 
@@ -95,6 +101,17 @@ def _state(npcs=(), items=(), inventory=()) -> WorldState:
 def test_an_npc_inside_the_fovea_wedge_is_attacked():
     state = _state([_npc(7, 100, 106)])  # 6 tiles north, dead ahead
     assert to_action(_cmd(attack=True), state, NORTH) == AttackFovea(npc_index=7)
+
+
+def test_a_non_attackable_npc_in_the_fovea_refuses_rather_than_retargets():
+    """Hans dead ahead, a chicken off to the side: the act is refused, not moved."""
+    state = _state([_npc(7, 100, 106, options=("Talk-to",)), _npc(8, 106, 100)])
+    assert to_action(_cmd(attack=True), state, NORTH) == Idle()
+
+
+def test_an_unreachable_npc_in_the_fovea_is_refused():
+    state = _state([_npc(7, 100, 106, reachable=False)])
+    assert to_action(_cmd(attack=True), state, NORTH) == Idle()
 
 
 def test_the_same_npc_outside_the_wedge_is_not_attacked_even_when_nearest():

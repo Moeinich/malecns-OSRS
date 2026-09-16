@@ -46,7 +46,14 @@ def _player(x: int, z: int, **kw) -> Player:
     return Player(**base)
 
 
-def _npc(index: int, x: int, z: int, combat_level: int = 1, in_combat: bool = False) -> Npc:
+def _npc(
+    index: int,
+    x: int,
+    z: int,
+    combat_level: int = 1,
+    in_combat: bool = False,
+    options: tuple[str, ...] = ("Attack",),
+) -> Npc:
     return Npc(
         id=1,
         index=index,
@@ -61,7 +68,7 @@ def _npc(index: int, x: int, z: int, combat_level: int = 1, in_combat: bool = Fa
         in_combat=in_combat,
         target_index=-1,
         reachable=True,
-        options=("Attack",),
+        options=options,
     )
 
 
@@ -214,6 +221,42 @@ def test_threat_scales_with_relative_combat_level():
         _state(_player(100, 100), [_npc(1, 100, 106, combat_level=6)]), grid, NORTH
     )
     assert strong[:, :, CH_THREAT].sum() > weak[:, :, CH_THREAT].sum()
+
+
+def test_an_npc_without_an_attack_option_is_not_painted_as_a_threat():
+    """Hans, the Lumbridge Guide, shopkeepers: the engine refuses the act silently."""
+    retina = Retina()
+    grid = _blank_grid()
+    state = _state(_player(100, 100), [_npc(1, 100, 106, options=("Talk-to", "Examine"))])
+    assert retina.render(state, grid, NORTH)[:, :, CH_THREAT].max() == 0.0
+
+
+def test_the_attack_option_is_matched_case_insensitively():
+    retina = Retina()
+    grid = _blank_grid()
+    state = _state(_player(100, 100), [_npc(1, 100, 106, options=("attack",))])
+    assert retina.render(state, grid, NORTH)[:, :, CH_THREAT].max() > 0.0
+
+
+def test_an_attackable_npc_keeps_the_level_ratio_intensity():
+    retina = Retina()
+    grid = _blank_grid()
+    mixed = _state(_player(100, 100), [_npc(1, 100, 106, options=("Attack", "Examine"))])
+    plain = _state(_player(100, 100), [_npc(1, 100, 106)])
+    np.testing.assert_allclose(
+        retina.render(mixed, grid, NORTH)[:, :, CH_THREAT],
+        retina.render(plain, grid, NORTH)[:, :, CH_THREAT],
+    )
+
+
+def test_the_in_combat_multiplier_still_applies():
+    retina = Retina()
+    grid = _blank_grid()
+    calm = retina.render(_state(_player(100, 100), [_npc(1, 100, 106)]), grid, NORTH)
+    fighting = retina.render(
+        _state(_player(100, 100), [_npc(1, 100, 106, in_combat=True)]), grid, NORTH
+    )
+    assert fighting[:, :, CH_THREAT].sum() > calm[:, :, CH_THREAT].sum()
 
 
 def test_locs_without_a_useful_option_are_not_resources():
