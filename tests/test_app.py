@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 
 import pytest
 
@@ -35,8 +36,9 @@ FORKER = (
 
 
 # A pgrep pattern is a regex, so the marker has to be free of regex punctuation.
-MARKER = "flybrain_test_stranger"
-STRANGER = f"import time; {MARKER} = 1; time.sleep(30)"
+# Unique per process so a leftover from a prior run can never be mistaken for this one's.
+def stranger_marker() -> str:
+    return f"flybrain_test_stranger_{os.getpid()}_{uuid.uuid4().hex}"
 
 
 def sleeper(tmp_path, name="sleeper", tier=LONG, code=FORKER, ready="READY"):
@@ -156,14 +158,16 @@ def test_listening_port_is_attached_not_double_started(tmp_path, sup):
 
 
 def test_down_leaves_processes_it_did_not_start_alone(tmp_path, sup):
-    stranger = subprocess.Popen([sys.executable, "-c", STRANGER], start_new_session=True)
+    marker = stranger_marker()
+    stranger_code = f"import time; {marker} = 1; time.sleep(30)"
+    stranger = subprocess.Popen([sys.executable, "-c", stranger_code], start_new_session=True)
     try:
         service = Service(
             name="stranger",
             tier=SHORT,
-            argv=[sys.executable, "-c", STRANGER],
+            argv=[sys.executable, "-c", stranger_code],
             cwd=tmp_path,
-            pattern=MARKER,
+            pattern=marker,
         )
         sup.services = [service]
         assert sup.start(service) == "attached"
@@ -175,20 +179,27 @@ def test_down_leaves_processes_it_did_not_start_alone(tmp_path, sup):
 
 
 def test_adopt_takes_ownership_of_a_running_stack(tmp_path, sup):
-    stranger = subprocess.Popen([sys.executable, "-c", STRANGER], start_new_session=True)
-    service = Service(
-        name="stranger",
-        tier=SHORT,
-        argv=[sys.executable, "-c", STRANGER],
-        cwd=tmp_path,
-        pattern=MARKER,
-    )
-    sup.services = [service]
-    assert sup.start(service, adopt=True) == "adopted"
-    sup.stop(grace=1.0)
-    # wait() reaps it; until then it is a zombie and still answers signal 0.
-    assert stranger.wait(timeout=5) == -signal.SIGTERM, "--adopt did not take ownership"
-    assert not alive(stranger.pid)
+    marker = stranger_marker()
+    stranger_code = f"import time; {marker} = 1; time.sleep(30)"
+    stranger = subprocess.Popen([sys.executable, "-c", stranger_code], start_new_session=True)
+    try:
+        service = Service(
+            name="stranger",
+            tier=SHORT,
+            argv=[sys.executable, "-c", stranger_code],
+            cwd=tmp_path,
+            pattern=marker,
+        )
+        sup.services = [service]
+        assert sup.start(service, adopt=True) == "adopted"
+        sup.stop(grace=1.0)
+        # wait() reaps it; until then it is a zombie and still answers signal 0.
+        assert stranger.wait(timeout=5) == -signal.SIGTERM, "--adopt did not take ownership"
+        assert not alive(stranger.pid)
+    finally:
+        if alive(stranger.pid):
+            stranger.kill()
+            stranger.wait()
 
 
 def test_restart_short_does_not_touch_the_long_tier(tmp_path, sup):
