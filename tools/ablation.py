@@ -21,6 +21,7 @@ import json
 import math
 import os
 import statistics
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -31,6 +32,16 @@ from typing import Any
 
 import numpy as np
 
+from flybrain.app import (
+    BROWSER,
+    DEFAULT_BOT,
+    DEFAULT_TICKRATE,
+    LITE,
+    ServiceFailed,
+    Supervisor,
+    bot_save_path,
+    default_services,
+)
 from flybrain.connectome.loader import DEFAULT_PATH, Connectome, load
 from flybrain.connectome.select import (
     MOTION_DETECTOR_TYPES,
@@ -73,6 +84,10 @@ DEFAULT_START = (3222, 3218)
 
 #: How long a reset walk may take before the stack counts as down.
 RESET_TIMEOUT_S = 90.0
+
+#: How long to wait for the sidecar's socket to come back after `reset_bot`
+#: restarts it, before the first episode of a condition tries to connect.
+SIDECAR_RECONNECT_TIMEOUT_S = 30.0
 
 SCALAR_METRICS = (
     "kills_per_hr",
@@ -621,6 +636,7 @@ class RunMeta:
     observed_tick_ms: float | None = None
     hud: bool = False
     start: tuple[int, int] | None = None
+    fresh_per_condition: bool = False
 
 
 def _tick_mismatch(meta: RunMeta) -> list[str]:
@@ -740,6 +756,11 @@ def report(
             if meta.start
             else "start              not reset (every episode began where the last one ended)"
         ),
+        (
+            "character          fresh per condition"
+            if meta.fresh_per_condition
+            else "character          carried over between conditions"
+        ),
         "",
         "-- means per condition " + "-" * 55,
     ]
@@ -853,6 +874,7 @@ class Stack:
     substeps: int | None
     hud: bool = False
     start: tuple[int, int] | None = DEFAULT_START
+    fresh_per_condition: bool = False
 
 
 def connect(socket_path: str, timeout: float = 30.0) -> BridgeClient:
@@ -869,6 +891,26 @@ def connect(socket_path: str, timeout: float = 30.0) -> BridgeClient:
     # in recv and the harness hangs instead of reporting the stack is down.
     client._sock.settimeout(timeout)
     return client
+
+
+def wait_for_sidecar(
+    socket_path: str, timeout: float = SIDECAR_RECONNECT_TIMEOUT_S, interval: float = 0.5
+) -> None:
+    """Retry `connect` until the sidecar `reset_bot` just restarted answers.
+
+    `connect` itself never retries — that contract is load-bearing everywhere
+    else in this file — so the bounded retry lives here, only for the one
+    connect that is expected to race a restart.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            connect(socket_path).close()
+            return
+        except StackDown:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(interval)
 
 
 def alive_states(client: BridgeClient, timeout: float = 120.0) -> Iterator[StateUpdate]:
@@ -1031,6 +1073,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="score from wherever the last episode ended (position drift is then a confound)",
     )
     p.add_argument("--dry-run", action="store_true", help="score the brain without moving the bot")
+    p.add_argument(
+        "--fresh-per-condition",
+        action="store_true",
+        help="give the bot a brand-new character before each condition (HP, inventory, XP and "
+        "loot otherwise carry over between conditions)",
+    )
+    p.add_argument("--tickrate", type=int, default=DEFAULT_TICKRATE)
+    p.add_argument("--bot", default=DEFAULT_BOT)
+    p.add_argument(
+        "--client",
+        choices=[LITE, BROWSER],
+        default=LITE,
+        help="lite: headless, no pixels. browser: Chromium on /bot, feeding the HUD. Only used "
+        "with --fresh-per-condition",
+    )
     p.add_argument("--out", default=None, help="write the JSON report here")
     p.add_argument(
         "--hud",
@@ -1059,6 +1116,7 @@ def main(argv: list[str] | None = None) -> int:
         substeps=args.substeps,
         hud=args.hud,
         start=None if args.no_reset else (args.start[0], args.start[1]),
+        fresh_per_condition=args.fresh_per_condition,
     )
     connectome = load(args.connectome)
     validate_conditions(args.conditions, connectome, args.seed)
@@ -1077,7 +1135,14 @@ def main(argv: list[str] | None = None) -> int:
         started=time.strftime("%Y-%m-%dT%H:%M:%S"),
         hud=args.hud,
         start=stack.start,
+        fresh_per_condition=args.fresh_per_condition,
     )
+
+    sup = client_service = sidecar_service = None
+    if args.fresh_per_condition:
+        sup = Supervisor(default_services(args.tickrate, args.bot, args.client))
+        client_service = next(s for s in sup.services if s.name in (LITE, BROWSER))
+        sidecar_service = next(s for s in sup.services if s.name == "sidecar")
 
     hud = feed = None
     if args.hud:
@@ -1100,6 +1165,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for condition in args.conditions:
             print(f"condition {condition}", file=sys.stderr)
+            if args.fresh_per_condition:
+                try:
+                    sup.reset_bot(
+                        args.bot, client_service, sidecar_service, bot_save_path(args.bot)
+                    )
+                except (ServiceFailed, subprocess.CalledProcessError) as exc:
+                    print(f"\n{exc}", file=sys.stderr)
+                    return 1
+                wait_for_sidecar(stack.socket)
             runs = run_condition(stack, condition, args.episodes, args.ticks, args.seed, hud, feed)
             meta = replace(meta, **tick_fields(runs))
             per_condition[condition] = [metrics(e) for e in runs]

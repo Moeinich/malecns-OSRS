@@ -10,10 +10,12 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from flybrain.app import ServiceFailed
 from flybrain.loop.types import Npc, Player, StateUpdate, WorldState
 from tools import ablation
 from tools.ablation import (
@@ -24,6 +26,7 @@ from tools.ablation import (
     SHUFFLE_DEGENERATE,
     SHUFFLE_DEGRADED,
     SHUFFLE_MATCHED,
+    UNCALIBRATED,
     Episode,
     RunMeta,
     Stack,
@@ -893,3 +896,121 @@ def test_the_report_says_where_every_episode_began():
         per_condition, computed, meta(start=(3222, 3218))
     )
     assert "not reset" in report(per_condition, computed, meta())
+
+
+# ------------------------------------------------------- fresh-per-condition
+
+
+def test_fresh_per_condition_flag_parses_into_stack_and_reads_both_ways_in_the_report():
+    args = build_parser().parse_args(["--fresh-per-condition"])
+    assert args.fresh_per_condition
+    assert args.tickrate == ablation.DEFAULT_TICKRATE
+    assert args.bot == ablation.DEFAULT_BOT
+    assert args.client == ablation.LITE
+
+    assert Stack(
+        socket="s",
+        connectome_path="c",
+        collision_path="x",
+        calibration_path="k",
+        dry_run=False,
+        learn=False,
+        substeps=None,
+        fresh_per_condition=True,
+    ).fresh_per_condition
+
+    per_condition, computed = full_run()
+    assert "character          fresh per condition" in report(
+        per_condition, computed, meta(fresh_per_condition=True)
+    )
+    assert "character          carried over between conditions" in report(
+        per_condition, computed, meta()
+    )
+
+
+class StubSupervisor:
+    """Records what `main()` asked of `reset_bot`, in call order."""
+
+    def __init__(self, services, calls: list) -> None:
+        self.services = services
+        self.calls = calls
+
+    def reset_bot(self, bot, client_service, sidecar_service, save_path):
+        self.calls.append(("reset", bot))
+
+
+def _fresh_per_condition_stubs(monkeypatch, calls: list, *, fail_on: str | None = None):
+    services = [SimpleNamespace(name="lite"), SimpleNamespace(name="sidecar")]
+
+    def make_supervisor(_services):
+        sup = StubSupervisor(services, calls)
+        if fail_on is not None:
+            original = sup.reset_bot
+
+            def reset_bot(bot, client_service, sidecar_service, save_path):
+                original(bot, client_service, sidecar_service, save_path)
+                if bot == fail_on:
+                    raise ServiceFailed("sidecar: did not come back")
+
+            sup.reset_bot = reset_bot
+        return sup
+
+    def stub_run_condition(stack, condition, episodes, ticks, seed, hud=None, feed=None):
+        calls.append(("run", condition))
+        return [episode([record()], condition=condition)]
+
+    monkeypatch.setattr(ablation, "Supervisor", make_supervisor)
+    monkeypatch.setattr(ablation, "default_services", lambda tickrate, bot, client: services)
+    monkeypatch.setattr(ablation, "bot_save_path", lambda bot: Path("save"))
+    monkeypatch.setattr(ablation, "wait_for_sidecar", lambda socket, **kw: None)
+    monkeypatch.setattr(ablation, "load", lambda path: object())
+    monkeypatch.setattr(ablation, "validate_conditions", lambda *a, **kw: None)
+    monkeypatch.setattr(ablation, "load_calibration", lambda *a, **kw: UNCALIBRATED)
+    monkeypatch.setattr(ablation, "run_condition", stub_run_condition)
+
+
+def test_fresh_per_condition_resets_once_per_condition_before_its_first_episode(monkeypatch):
+    calls: list = []
+    _fresh_per_condition_stubs(monkeypatch, calls)
+
+    rc = ablation.main(
+        [
+            "--conditions",
+            "real",
+            "shuffle",
+            "--fresh-per-condition",
+            "--episodes",
+            "1",
+            "--ticks",
+            "1",
+        ]
+    )
+
+    assert rc == 0
+    assert calls == [
+        ("reset", ablation.DEFAULT_BOT),
+        ("run", "real"),
+        ("reset", ablation.DEFAULT_BOT),
+        ("run", "shuffle"),
+    ]
+
+
+def test_a_failed_reset_stops_the_run_before_scoring_the_condition(monkeypatch):
+    calls: list = []
+    _fresh_per_condition_stubs(monkeypatch, calls, fail_on=ablation.DEFAULT_BOT)
+
+    rc = ablation.main(
+        [
+            "--conditions",
+            "real",
+            "shuffle",
+            "--fresh-per-condition",
+            "--episodes",
+            "1",
+            "--ticks",
+            "1",
+        ]
+    )
+
+    assert rc == 1
+    assert calls == [("reset", ablation.DEFAULT_BOT)]
