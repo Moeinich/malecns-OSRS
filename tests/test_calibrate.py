@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import replace
 from unittest import mock
 
 import numpy as np
@@ -14,12 +15,14 @@ from flybrain.engine import calibrate as calibrate_module
 from flybrain.engine.calibrate import (
     BIMODALITY_UNIFORM,
     DEFAULT_DT_MS,
+    DEFAULT_MIN_PROPAGATION_Z,
     DEFAULT_SPONTANEOUS_NOISE_STD,
     DEFAULT_TONIC_FRACTION,
     DEFAULT_V_REST,
     DEFAULT_V_THRESH,
     FRAME_MS,
     NULL_CLAUSE,
+    PROPAGATION_CLAUSE,
     SATURATION_FRACTION,
     SUBFRAMES_PER_TICK,
     TICK_MS,
@@ -29,6 +32,7 @@ from flybrain.engine.calibrate import (
     format_report,
     measure_gain,
     noise_std_for_dt,
+    propagation_probe,
     sensory_drive,
     steps_for,
     summarize_rates,
@@ -499,3 +503,100 @@ def test_the_encoder_drive_is_a_pure_function_of_the_step():
     # Held for a whole sub-frame, and reproduced after the cache has rolled past.
     assert np.array_equal(drive(0), first)
     assert np.array_equal(drive(steps * 9), later)
+
+
+@pytest.mark.skipif(
+    not (loader.DEFAULT_PATH.exists() and vocab.DEFAULT_ANNOTATIONS_PATH.exists()),
+    reason="connectome_v1.npz or the annotations feather is missing; run the build first",
+)
+def test_the_prey_scene_is_a_different_input_from_the_empty_one():
+    """If the two scenes encode identically there is nothing to propagate and the
+    clause would read z = 0 for a reason that has nothing to do with the network."""
+    from flybrain.connectome.loader import load
+    from flybrain.sensory.encode import LUMINANCE_TYPES
+
+    c = load()
+    kw = {"dt_ms": 2.0, "frame_steps": 19}
+    empty = encoder_drive(c, **kw)(0)
+    prey = encoder_drive(c, npc_ahead=4.0, **kw)(0)
+
+    assert not np.array_equal(empty, prey)
+    # Retinal, not a second injection site: whatever the prey lights, it lights
+    # through the same layer the empty scene drives.
+    layer = np.unique(np.concatenate([c.populations[t] for t in LUMINANCE_TYPES]))
+    assert set(np.flatnonzero(prey)) <= set(layer)
+
+
+def _rates(propagation_z: float | None, input_z: float | None = 38.0):
+    """A healthy rate distribution that passes every other clause."""
+    rng = np.random.default_rng(0)
+    r = summarize_rates(10 ** rng.normal(0.3, 0.2, 2000), max_hz=333.0)
+    return replace(r, propagation_z=propagation_z, input_z=input_z)
+
+
+def test_a_stimulus_that_reaches_the_input_and_stops_there_is_rejected():
+    """The measurement that forced the clause: every rate clause passes, and the
+    prey never reaches the output. -0.04 is `descending_neuron` at the calibrated
+    point, 38 is the injected cells in the same run."""
+    assert Acceptance().reject(_rates(None)) == []  # unmeasured; the probe is loud, not this
+
+    clauses = Acceptance().reject(_rates(-0.04))
+    assert len(clauses) == 1
+    assert clauses[0].startswith(PROPAGATION_CLAUSE)
+    assert "input present" in clauses[0] and "propagation absent" in clauses[0]
+
+    # A z at the margin is accepted, and a dead input reads as a different failure.
+    assert Acceptance().reject(_rates(DEFAULT_MIN_PROPAGATION_Z)) == []
+    assert "never reached" in Acceptance().reject(_rates(-0.04, input_z=0.0))[0]
+    assert Acceptance(min_propagation_z=None).reject(_rates(-0.04)) == []
+
+
+def test_a_network_in_band_that_does_not_propagate_is_failed_not_rejected_quietly():
+    n = 500
+    W = _graded_net(n)
+    drive = _drive(n, background=12.0, sensory=50, active_fraction=0.1)
+    kw = {"drive": drive, "gain_range": (1.0, 30.0), "max_iter": 12, **HONEST}
+
+    dead = calibrate_gain(W, propagation=lambda W_, gain: (38.0, -0.04), **kw)
+
+    assert not dead.success
+    assert dead.measurement is None  # the invariant: measurement is not None <=> success
+    assert dead.rejected is not None
+    assert 1.0 <= dead.rejected.rates.mean_hz <= 5.0
+    assert (dead.rejected.rates.propagation_z, dead.rejected.rates.input_z) == (-0.04, 38.0)
+    assert PROPAGATION_CLAUSE in dead.failure
+    assert "z -0.04 at the target population, 38.00 at the injected cells" in format_report(dead)
+
+    alive = calibrate_gain(W, propagation=lambda W_, gain: (38.0, 4.4), **kw)
+
+    assert alive.success, alive.failure
+    assert alive.measurement.rates.propagation_z == 4.4
+    assert "CALIBRATED" in format_report(alive)
+
+
+def test_a_search_without_the_probe_says_unchecked_rather_than_passing():
+    n = 500
+    W = _graded_net(n)
+    drive = _drive(n, background=12.0, sensory=50, active_fraction=0.1)
+
+    result = calibrate_gain(W, drive=drive, gain_range=(1.0, 30.0), max_iter=12, **HONEST)
+
+    assert result.success, result.failure
+    assert result.measurement.rates.propagation_z is None
+    assert "propagation      unchecked" in format_report(result)
+
+
+def test_propagation_cannot_be_measured_without_the_annotations():
+    """A calibration that cannot check propagation must not claim it did."""
+    with (
+        mock.patch.object(calibrate_module, "superclasses", lambda c: None),
+        pytest.raises(RuntimeError, match=PROPAGATION_CLAUSE),
+    ):
+        propagation_probe(object())
+
+    other = (np.zeros(4, dtype=np.int16), ("neck_connective",))
+    with (
+        mock.patch.object(calibrate_module, "superclasses", lambda c: other),
+        pytest.raises(RuntimeError, match="not in this build"),
+    ):
+        propagation_probe(object())

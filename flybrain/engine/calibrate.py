@@ -58,7 +58,8 @@ from pathlib import Path
 import numpy as np
 import scipy.sparse as sp
 
-from flybrain.connectome.loader import DEFAULT_INCOMING_CAP, normalize_incoming
+from flybrain.connectome.loader import DEFAULT_INCOMING_CAP, normalize_incoming, superclasses
+from flybrain.connectome.vocab import DESCENDING_SUPERCLASS
 from flybrain.engine.lif import LIFEngine
 
 #: Resting band for fly central neurons. At dt=1 ms, 5 Hz is 0.5% of neurons per
@@ -89,6 +90,50 @@ DEFAULT_NULL_MARGIN = 1.5
 
 #: The name of that clause, so a rejection can be recognised without parsing prose.
 NULL_CLAUSE = "connectome_contribution"
+
+#: How many standard deviations an attackable NPC in the fovea has to move the
+#: target population's pooled rate.
+#:
+#: The clause exists because the calibration accepted a network that ticks in band
+#: and does not compute. At gain 0.29907, tonic 0.9, capped/500, noise 2.83, dt 2
+#: — a point that passes the band, the silent and saturated fractions, the
+#: bimodality and the null by 2.2x — a prey stimulus dead ahead measures
+#:
+#:     injected cells      z = 38
+#:     hop 1               z = 4.4   (0.02 on the shuffle, so it is the wiring)
+#:     hop 2               z = -0.02, zero responding cells of 45,126
+#:     descending_neuron   z = -0.04
+#:
+#: Every rate clause is a statement about the *distribution*; none of them can see
+#: that the input never reaches the output. 2.0 is `tools/probe_prey.py`'s own bar.
+DEFAULT_MIN_PROPAGATION_Z = 2.0
+
+#: The name of that clause, so a rejection can be recognised without parsing prose.
+PROPAGATION_CLAUSE = "propagation"
+
+#: The propagation windows, in ticks, and the loop's own substeps per sub-frame.
+#: 5 + 50 ticks of 4x19 steps is 4,180 steps per scene, 8,360 per evaluation —
+#: seconds, not the 8 s the rate measurement needs, because a z between two scenes
+#: is a difference and not a claim about metastability. `substeps` is the live
+#: loop's floor rather than `FRAME_MS / dt`: the claim is about the regime the
+#: brain actually runs in.
+PROPAGATION_TICKS = 50
+PROPAGATION_WARMUP_TICKS = 5
+PROPAGATION_SUBSTEPS = 19
+
+#: Where the probe puts its prey: 4 tiles dead ahead, inside the gaze wedge.
+PROPAGATION_NPC_TILES = 4.0
+
+#: Ticks of the walk the two propagation scenes run over. **1, i.e. standing
+#: still**, unlike the gain measurement, and that is the difference between a
+#: measurement and a number. `z` divides by the *unstimulated* scene's std, so a
+#: walking baseline puts the walk's own frame-to-frame variance in the
+#: denominator: measured at the calibrated point, the injected cells read z = 38
+#: standing still and z = 0.14 over a 128-tick walk, for the same prey. The second
+#: figure is a statement about how much the scene changes when you move, not about
+#: whether the stimulus arrived, and under it no network could ever clear the
+#: clause at hop 0, let alone downstream.
+PROPAGATION_PATH_TICKS = 1
 
 #: A neuron above this fraction of its refractory-limited maximum is saturated.
 SATURATION_FRACTION = 0.5
@@ -250,6 +295,11 @@ class RateSummary:
     bimodality: float
     histogram: np.ndarray
     bin_edges_hz: np.ndarray
+    #: How far a prey stimulus moves the target population, and the injected
+    #: cells, in standard deviations of the unstimulated scene. `None` means
+    #: propagation was never measured — never that it passed.
+    propagation_z: float | None = None
+    input_z: float | None = None
 
     @property
     def looks_lognormal(self) -> bool:
@@ -267,8 +317,11 @@ class Acceptance:
     judgment call, which is why they are fields and not literals scattered through
     the search.
 
-    `median_hz > 0` is the strongest clause, and `null_margin` is the one that
-    makes the band mean anything: see `NULL_CLAUSE`.
+    `median_hz > 0` is the strongest clause, `null_margin` is the one that makes
+    the band mean anything (`NULL_CLAUSE`), and `min_propagation_z` is the one
+    that makes the whole network mean anything (`PROPAGATION_CLAUSE`): every other
+    clause reads the rate distribution, and a distribution cannot show that the
+    input never reaches the output.
     """
 
     target_hz: tuple[float, float] = DEFAULT_TARGET_HZ
@@ -278,6 +331,10 @@ class Acceptance:
     require_median_above_zero: bool = True
     max_bimodality: float = BIMODALITY_UNIFORM
     null_margin: float = DEFAULT_NULL_MARGIN
+    #: `None` skips the clause outright, for a drive that renders no scene. A
+    #: number is a promise that propagation was measured: see `PROPAGATION_CLAUSE`.
+    min_propagation_z: float | None = DEFAULT_MIN_PROPAGATION_Z
+    propagation_superclass: str = DESCENDING_SUPERCLASS
 
     def reject(self, r: RateSummary, null_mean_hz: float | None = None) -> list[str]:
         """The clauses this rate distribution fails. Empty means accepted.
@@ -289,6 +346,22 @@ class Acceptance:
         lo, hi = self.target_hz
         p99 = r.percentiles_hz[99]
         contribution = None if not null_mean_hz else r.mean_hz / null_mean_hz
+        z, z_in = r.propagation_z, r.input_z
+        reached = z_in is not None and z_in >= (self.min_propagation_z or 0.0)
+        no_propagation = (
+            ""
+            if z is None or self.min_propagation_z is None
+            else (
+                f"{PROPAGATION_CLAUSE}: prey in the fovea moves "
+                f"{self.propagation_superclass} by z {z:.2f}, below the "
+                f"{self.min_propagation_z:g} margin — "
+                + (
+                    f"input present (z {z_in:.2f} at the injected cells), propagation absent"
+                    if reached
+                    else "the stimulus never reached the injected cells either"
+                )
+            )
+        )
         checks = (
             (not lo <= r.mean_hz <= hi, f"mean_hz {r.mean_hz:.3f} outside {lo}-{hi}"),
             (
@@ -321,6 +394,10 @@ class Acceptance:
                     if contribution is not None
                     else ""
                 ),
+            ),
+            (
+                self.min_propagation_z is not None and z is not None and z < self.min_propagation_z,
+                no_propagation,
             ),
         )
         return [why for failed, why in checks if failed]
@@ -447,6 +524,7 @@ def encoder_drive(
     subframes: int = SUBFRAMES_PER_TICK,
     collision=None,
     path_ticks: int = 128,
+    npc_ahead: float | None = None,
     seed: int = 0,
 ) -> Drive:
     """The drive the live loop actually injects: real retina frames through `encode`.
@@ -473,7 +551,7 @@ def encoder_drive(
     # Deferred: `flybrain.engine` must not depend on `flybrain.sensory` or the
     # loop. The injection layer and the raster have one definition each and this
     # is the point of reading them rather than approximating them.
-    from flybrain.loop.types import Player, WorldState
+    from flybrain.loop.types import Npc, Player, WorldState
     from flybrain.sensory.collision import CollisionGrid
     from flybrain.sensory.encode import EncodeParams, encode
     from flybrain.sensory.retina import Retina
@@ -508,12 +586,40 @@ def encoder_drive(
             in_game=True,
             modal_open=False,
             player=player,
-            npcs=(),
+            npcs=prey(tick, player),
             ground_items=(),
             locs=(),
             inventory=(),
             skills={},
             op_rejected_count=0,
+        )
+
+    def prey(tick: int, player: Player) -> tuple:
+        """One attackable NPC `npc_ahead` tiles along the heading, or nothing.
+
+        Copied from `tools/probe_prey.py` rather than imported: that module reads
+        `flybrain.motor` at import, and `flybrain.engine` must not.
+        """
+        if npc_ahead is None:
+            return ()
+        bearing = heading(tick)
+        return (
+            Npc(
+                id=1,
+                index=1,
+                name="prey",
+                combat_level=1,
+                x=round(player.x + npc_ahead * math.cos(bearing)),
+                z=round(player.z + npc_ahead * math.sin(bearing)),
+                size=1,
+                distance=int(npc_ahead),
+                hp=10,
+                max_hp=10,
+                in_combat=False,
+                target_index=-1,
+                reachable=True,
+                options=("Attack",),
+            ),
         )
 
     def heading(tick: int) -> float:
@@ -564,6 +670,117 @@ def _walk(collision, ticks: int, seed: int) -> list[tuple[int, int]]:
                 break
         out.append((x, z))
     return out
+
+
+#: `(input_z, target_z)` at a candidate gain: the propagation measurement.
+Propagation = Callable[[sp.csc_matrix, float], tuple[float, float]]
+
+
+def propagation_probe(
+    connectome,
+    *,
+    params=None,
+    dt_ms: float = DEFAULT_DT_MS,
+    tonic_fraction: float = 0.0,
+    noise_std: float = DEFAULT_SPONTANEOUS_NOISE_STD,
+    superclass: str = DESCENDING_SUPERCLASS,
+    substeps: int = PROPAGATION_SUBSTEPS,
+    ticks: int = PROPAGATION_TICKS,
+    warmup_ticks: int = PROPAGATION_WARMUP_TICKS,
+    npc_tiles: float = PROPAGATION_NPC_TILES,
+    path_ticks: int = PROPAGATION_PATH_TICKS,
+    collision=None,
+    seed: int = 0,
+    engine_kwargs: dict | None = None,
+) -> Propagation:
+    """Does a stimulus reach `superclass` at all? Returns a probe of `(W, gain)`.
+
+    Two windows from the same seed over the calibration's own walk, differing only
+    in whether an attackable NPC stands `npc_tiles` dead ahead. The pooled rate per
+    tick of the target population gives `z = (meanB - meanA) / stdA`, and the same
+    z at the injected cells says whether a z of zero downstream means "no
+    propagation" or "no input".
+
+    The hop-0 pool is every cell the encoder drives, not `probe_prey`'s chromatic
+    row, so it is diluted by the cells the prey never touches: at the calibrated
+    point it reads z 4.52 where the probe's narrower pool reads 38. Same statement
+    — the stimulus arrives — an order of magnitude apart, so the two numbers are
+    not interchangeable.
+
+    The target population is resolved *now*, not at the first evaluation: a search
+    that discovers after eight minutes that it cannot check the clause has already
+    spent the eight minutes, and a clause that cannot be checked must not be
+    claimed. Missing annotations are therefore an error here, and the caller's
+    answer is `--no-propagation`, not silence.
+    """
+    codes = superclasses(connectome)
+    if codes is None:
+        raise RuntimeError(
+            f"{PROPAGATION_CLAUSE}: no superclass annotations, so {superclass} cannot be "
+            "located and propagation cannot be measured — build the annotations or pass "
+            "--no-propagation to skip the clause explicitly"
+        )
+    code, labels = codes
+    if superclass not in labels:
+        raise RuntimeError(
+            f"{PROPAGATION_CLAUSE}: superclass {superclass!r} is not in this build "
+            f"({len(labels)} labels) — propagation cannot be measured"
+        )
+    targets = np.flatnonzero(code == labels.index(superclass))
+    if not targets.size:
+        raise RuntimeError(f"{PROPAGATION_CLAUSE}: no {superclass} cells in this build")
+
+    if collision is None:
+        from flybrain.sensory.collision import CollisionGrid
+
+        collision = CollisionGrid.load()
+    kw = {
+        "params": params,
+        "dt_ms": dt_ms,
+        "frame_steps": substeps,
+        "path_ticks": path_ticks,
+        "collision": collision,
+        "seed": seed,
+    }
+    empty = encoder_drive(connectome, **kw)
+    prey = encoder_drive(connectome, npc_ahead=npc_tiles, **kw)
+    injected = np.flatnonzero(prey(0) > 0.0)
+    tonic = tonic_current(tonic_fraction) if tonic_fraction else 0.0
+    window = substeps * SUBFRAMES_PER_TICK
+    pools = {"input": injected, "target": targets}
+
+    def run(W: sp.csc_matrix, gain: float, drive: Drive) -> dict[str, np.ndarray]:
+        scaled = sp.csc_matrix(
+            (W.data.astype(np.float32) * np.float32(gain), W.indices, W.indptr), shape=W.shape
+        )
+        engine = LIFEngine(
+            scaled,
+            dt_ms=dt_ms,
+            rate_window_ms=window * dt_ms,
+            **{"spontaneous_noise_std": noise_std, "seed": 0, **(engine_kwargs or {})},
+        )
+        driven = with_tonic(drive, W.shape[0], tonic)
+        out: dict[str, list[float]] = {name: [] for name in pools}
+        for tick in range(warmup_ticks + ticks):
+            for step in range(tick * window, (tick + 1) * window):
+                engine.step(driven(step))
+            if tick < warmup_ticks:
+                continue
+            rates = engine.get_firing_rates(window)
+            for name, idx in pools.items():
+                out[name].append(float(rates[idx].mean()) if len(idx) else 0.0)
+        return {k: np.asarray(v) for k, v in out.items()}
+
+    def probe(W: sp.csc_matrix, gain: float) -> tuple[float, float]:
+        a, b = run(W, gain, empty), run(W, gain, prey)
+
+        def z(name: str) -> float:
+            std = float(a[name].std())
+            return 0.0 if std == 0.0 else float((b[name].mean() - a[name].mean()) / std)
+
+        return z("input"), z("target")
+
+    return probe
 
 
 def tonic_current(
@@ -671,6 +888,7 @@ def calibrate_gain(
     normalize: str = "none",
     incoming_cap: float = DEFAULT_INCOMING_CAP,
     tonic_fraction: float = 0.0,
+    propagation: Propagation | None = None,
     engine_kwargs: dict | None = None,
 ) -> CalibrationResult:
     """Bisect a scalar synaptic multiplier on the mean rate; accept on `Acceptance`.
@@ -719,6 +937,11 @@ def calibrate_gain(
 
     def settle(m: Measurement, iterations: int) -> CalibrationResult:
         """The mean is in band. Whether that is a calibration is a separate question."""
+        # Measured here and nowhere else, like the null: only the point that is
+        # about to be accepted has to answer for propagation.
+        if propagation is not None and accept.min_propagation_z is not None:
+            input_z, target_z = propagation(W, m.gain)
+            m = replace(m, rates=replace(m.rates, propagation_z=target_z, input_z=input_z))
         clauses = accept.reject(m.rates, null_hz)
         if clauses:
             return CalibrationResult(
@@ -915,6 +1138,15 @@ def format_report(result: CalibrationResult) -> str:
                 f"({'lognormal-ish' if r.looks_lognormal else 'BIMODAL'})"
             ),
             f"ms/step          {m.ms_per_step:.3f}",
+            "propagation      "
+            + (
+                "unchecked"
+                if r.propagation_z is None
+                else (
+                    f"z {r.propagation_z:.2f} at the target population, "
+                    f"{r.input_z:.2f} at the injected cells"
+                )
+            ),
         ]
     return "\n".join(lines)
 
@@ -970,6 +1202,18 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_NULL_MARGIN,
         help="how many times the connectome-free null the accepted rate must be",
     )
+    p.add_argument(
+        "--min-propagation-z",
+        type=float,
+        default=DEFAULT_MIN_PROPAGATION_Z,
+        help="how many standard deviations prey in the fovea must move "
+        f"{DESCENDING_SUPERCLASS}; see PROPAGATION_CLAUSE",
+    )
+    p.add_argument(
+        "--no-propagation",
+        action="store_true",
+        help="skip the propagation clause and say so, rather than claim it was checked",
+    )
     p.add_argument("--trim-thresholds", action="store_true")
     p.add_argument(
         "--save",
@@ -1004,7 +1248,25 @@ def main(argv: list[str] | None = None) -> int:
             f"sensory_drive over {'/'.join(LUMINANCE_TYPES)}, amplitude {args.amplitude:g}, "
             f"active_fraction {args.active_fraction:g}"
         )
-    acceptance = Acceptance(target_hz=tuple(args.target), null_margin=args.null_margin)
+    # The synthetic drive renders no scene, so there is no prey stimulus to
+    # propagate — skipped out loud, never quietly passed.
+    check_propagation = not args.no_propagation and args.drive == "encoder"
+    acceptance = Acceptance(
+        target_hz=tuple(args.target),
+        null_margin=args.null_margin,
+        min_propagation_z=args.min_propagation_z if check_propagation else None,
+    )
+    probe = (
+        propagation_probe(
+            connectome,
+            params=params,
+            dt_ms=args.dt,
+            tonic_fraction=args.tonic_fraction,
+            noise_std=noise_std,
+        )
+        if check_propagation
+        else None
+    )
     result = calibrate_gain(
         connectome.W,
         acceptance=acceptance,
@@ -1020,6 +1282,7 @@ def main(argv: list[str] | None = None) -> int:
         incoming_cap=args.incoming_cap,
         tonic_fraction=args.tonic_fraction,
         trim_thresholds=args.trim_thresholds,
+        propagation=probe,
     )
     print(f"connectome       {args.path}  N={connectome.n}  nnz={connectome.W.nnz}")
     print(f"normalize        {args.normalize}  cap {args.incoming_cap:g}")
@@ -1030,6 +1293,21 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"tonic            {args.tonic_fraction:g} of threshold distance "
         f"= {tonic_current(args.tonic_fraction):.3f}  noise_std {noise_std:g}"
+    )
+    print(
+        "propagation      "
+        + (
+            f"{DESCENDING_SUPERCLASS} must move z >= {args.min_propagation_z:g}, "
+            f"{PROPAGATION_WARMUP_TICKS}+{PROPAGATION_TICKS} ticks x "
+            f"{SUBFRAMES_PER_TICK}x{PROPAGATION_SUBSTEPS} substeps per scene"
+            if check_propagation
+            else "NOT CHECKED — "
+            + (
+                "--no-propagation"
+                if args.no_propagation
+                else "the synthetic drive renders no scene to put prey in"
+            )
+        )
     )
     print(format_report(result))
     if args.save and result.success:

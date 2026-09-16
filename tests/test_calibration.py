@@ -240,3 +240,29 @@ def test_tonic_drive_is_a_constant_short_of_threshold():
     drive = Calibration(gain=1.0, tonic_fraction=0.9).tonic_drive(n)
     assert drive.shape == (n,)
     np.testing.assert_allclose(drive, 0.9 * 15.0)  # v_thresh - v_rest = 15 mV
+
+
+def test_an_artifact_without_a_propagation_z_is_described_as_unchecked(tmp_path):
+    """An artifact that never measured propagation must say so. Its `rates` look
+    perfectly healthy either way — that is the whole reason the clause exists."""
+    back = load_calibration(_calibration(_connectome()).save(tmp_path / "c.json"))
+
+    assert back.rates.propagation_z is None
+    assert "propagation unchecked" in back.describe()
+
+
+def test_the_measured_propagation_and_its_threshold_round_trip(tmp_path):
+    c = _calibration(_connectome())
+    c = replace(
+        c,
+        rates=replace(c.rates, propagation_z=-0.04, input_z=38.0),
+        acceptance=Acceptance(min_propagation_z=2.0),
+    )
+    back = load_calibration(c.save(tmp_path / "c.json"))
+
+    assert (back.rates.propagation_z, back.rates.input_z) == (-0.04, 38.0)
+    assert back.acceptance.min_propagation_z == 2.0
+    assert "propagation z -0.04 (>= 2)" in back.describe()
+    stored = json.loads((tmp_path / "c.json").read_text())
+    assert stored["rates"]["propagation_z"] == -0.04
+    assert stored["acceptance"]["min_propagation_z"] == 2.0

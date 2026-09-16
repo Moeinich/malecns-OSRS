@@ -164,8 +164,22 @@ class Calibration:
         tonic = "none" if self.tonic_fraction is None else f"{self.tonic_fraction:.3g}"
         return (
             f"gain {self.gain:.6g}  dt {self.dt_ms:g} ms  band {lo}-{hi} Hz  "
-            f"measured {rate}  normalize {self.normalization}  tonic {tonic}"
+            f"measured {rate}  normalize {self.normalization}  tonic {tonic}  "
+            f"{self.propagation}"
         )
+
+    @property
+    def propagation(self) -> str:
+        """What the artifact says about propagation — and an artifact that says
+        nothing says *unchecked*, never that the clause passed. Only a rate lives
+        in `rates`; a network whose input never reaches its output has a perfectly
+        healthy one."""
+        z = None if self.rates is None else self.rates.propagation_z
+        if z is None:
+            return "propagation unchecked"
+        margin = (self.acceptance or Acceptance()).min_propagation_z
+        bar = "" if margin is None else f" (>= {margin:g})"
+        return f"propagation z {z:.2f}{bar}"
 
     def save(self, path: Path | str = DEFAULT_CALIBRATION_PATH) -> Path:
         path = Path(path)
