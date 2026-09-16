@@ -91,6 +91,7 @@ SIDECAR_RECONNECT_TIMEOUT_S = 30.0
 
 SCALAR_METRICS = (
     "kills_per_hr",
+    "retaliation_kills_per_hr",
     "xp_per_hr",
     "deaths_per_hr",
     "mean_hp_fraction",
@@ -105,6 +106,12 @@ SCALAR_METRICS = (
 #: The sidecar's `deadlineFraction`. Source of truth is bridge/config.ts, which
 #: reads the same variable; restated rather than imported so a drift is findable.
 DEADLINE_FRACTION = float(os.environ.get("RS_DEADLINE_FRACTION") or 0.85)
+
+#: How long an `attack_fovea` keeps crediting the fly for a kill on that NPC.
+#: 60 game ticks is ~10 s at the 176 ms we run, well past the few hits a
+#: low-level NPC survives, so an attack goes stale rather than crediting a
+#: retaliation the fly happened to be near.
+ENGAGEMENT_TICKS = 60
 
 #: An overrun fraction at or below this is not a material confound.
 NEGLIGIBLE_OVERRUN = 0.01
@@ -189,6 +196,7 @@ class TickRecord:
     z: int
     xp: int
     kills: int
+    retaliation_kills: int
     deaths: int
     mean_rate_hz: float
     overrun: bool
@@ -216,12 +224,19 @@ class Recorder:
 
     Kills and deaths are edge-detected here because nothing upstream carries
     them: `TickReport` knows the action, the world state knows the consequence.
+
+    A kill is only the fly's if the fly attacked that NPC index. The engine's
+    auto-retaliate engages whatever attacks the bot and kills it without the
+    brain ever deciding to, so those land in `retaliation_kills` instead.
     """
 
     def __init__(self) -> None:
         self.records: list[TickRecord] = []
         self.observed_tick_ms: float | None = None
-        self._engaged: set[int] = set()
+        #: npc index -> was this engagement the fly's own doing.
+        self._engaged: dict[int, bool] = {}
+        #: npc index -> tick of the last `attack_fovea` aimed at it.
+        self._attacked: dict[int, int] = {}
         self._life_id: int | None = None
 
     def observe(self, update: StateUpdate, report: Any) -> TickRecord | None:
@@ -231,6 +246,8 @@ class Recorder:
         player = update.state.player
         if player is None:
             return None
+        self._note(report.action, update.tick)
+        kills, retaliation_kills = self._kills(update)
         record = TickRecord(
             tick=update.tick,
             action=report.action.kind,
@@ -239,7 +256,8 @@ class Recorder:
             x=player.x,
             z=player.z,
             xp=sum(update.state.skills.values()),
-            kills=self._kills(update),
+            kills=kills,
+            retaliation_kills=retaliation_kills,
             deaths=self._deaths(player),
             mean_rate_hz=float(report.mean_rate_hz),
             overrun=bool(report.overrun),
@@ -248,24 +266,40 @@ class Recorder:
         self.records.append(record)
         return record
 
-    def _kills(self, update: StateUpdate) -> int:
+    def _note(self, action: Any, tick: int) -> None:
+        """Fleeing ends the fly's claim on everything it was fighting."""
+        if action.kind == "flee":
+            self._attacked.clear()
+            self._engaged = dict.fromkeys(self._engaged, False)
+        elif action.kind == "attack_fovea":
+            self._attacked[action.npc_index] = tick
+
+    def _kills(self, update: StateUpdate) -> tuple[int, int]:
         present = {npc.index: npc for npc in update.state.npcs}
-        kills = 0
+        kills = retaliation = 0
         for index in sorted(self._engaged):
             npc = present.get(index)
             if npc is None or (npc.hp is not None and npc.hp <= 0):
-                kills += 1
-                self._engaged.discard(index)
+                if self._engaged.pop(index):
+                    kills += 1
+                else:
+                    retaliation += 1
         player = update.state.player
         if player is None or player.target_type != "npc":
-            return kills
+            return kills, retaliation
         # Only a target still standing is engaged: the game leaves the dead
         # NPC's index on the player for a tick or two, and re-engaging it would
         # count the same kill again on the tick its corpse disappears.
         target = present.get(player.target_index)
         if target is not None and (target.hp is None or target.hp > 0):
-            self._engaged.add(player.target_index)
-        return kills
+            self._engaged.setdefault(
+                player.target_index, self._initiated(player.target_index, update.tick)
+            )
+        return kills, retaliation
+
+    def _initiated(self, index: int, tick: int) -> bool:
+        attacked = self._attacked.get(index)
+        return attacked is not None and tick - attacked <= ENGAGEMENT_TICKS
 
     def _deaths(self, player: Any) -> int:
         previous, self._life_id = self._life_id, player.life_id
@@ -322,6 +356,7 @@ def metrics(episode: Episode) -> dict[str, float]:
     out = {
         "ticks": float(len(r)),
         "kills_per_hr": sum(x.kills for x in r) / hours,
+        "retaliation_kills_per_hr": sum(x.retaliation_kills for x in r) / hours,
         "xp_per_hr": max(0, r[-1].xp - r[0].xp) / hours,
         "deaths_per_hr": sum(x.deaths for x in r) / hours,
         "mean_hp_fraction": _mean([x.hp / x.max_hp for x in r if x.max_hp > 0]),
@@ -710,21 +745,39 @@ def _decoder_caveat(per_condition: dict[str, list[dict[str, float]]]) -> str:
         "directed movement is slow and the steering metrics (distance, tortuosity) are "
         "correspondingly noisy. "
     )
-    killing = [
-        (condition, kills)
-        for condition, runs in per_condition.items()
-        if math.isfinite(kills := _mean(_column(runs, "kills_per_hr"))) and kills > 0
-    ]
-    if killing:
-        return (
-            head
-            + "Kills were not zero in every condition this run: "
-            + ", ".join(f"{c} {k:.3g}/hr" for c, k in killing)
+    killing = _nonzero(per_condition, "kills_per_hr")
+    body = (
+        "Kills were not zero in every condition this run: "
+        + ", ".join(f"{c} {k:.3g}/hr" for c, k in killing)
+        if killing
+        else (
+            "Zero kills in every condition is a result about the decoder's dynamic range, not a "
+            "broken harness."
         )
-    return head + (
-        "Zero kills in every condition is a result about the decoder's dynamic range, not a "
-        "broken harness."
     )
+    retaliating = _nonzero(per_condition, "retaliation_kills_per_hr")
+    if not retaliating:
+        return head + body
+    named = ", ".join(f"{c} {k:.3g}/hr" for c, k in retaliating)
+    return (
+        head
+        + body
+        + (
+            f" Retaliation kills did happen ({named}) — the engine's auto-retaliate fought back and "
+            "killed without the brain ever issuing an attack, so they are excluded from "
+            "kills_per_hr and reported as retaliation_kills_per_hr."
+        )
+    )
+
+
+def _nonzero(
+    per_condition: dict[str, list[dict[str, float]]], metric: str
+) -> list[tuple[str, float]]:
+    return [
+        (condition, value)
+        for condition, runs in per_condition.items()
+        if math.isfinite(value := _mean(_column(runs, metric))) and value > 0
+    ]
 
 
 def report(

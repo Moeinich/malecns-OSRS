@@ -22,6 +22,7 @@ from tools import ablation
 from tools.ablation import (
     DEADLINE_FRACTION,
     DEFAULT_START,
+    ENGAGEMENT_TICKS,
     SHUFFLE_ABSENT,
     SHUFFLE_BETTER,
     SHUFFLE_DEGENERATE,
@@ -42,6 +43,7 @@ from tools.ablation import (
     effects,
     hedges_g,
     hud_tick,
+    metric_names,
     metrics,
     partial_json,
     record_episode,
@@ -121,26 +123,40 @@ def update(
 
 
 class FakeAction:
-    def __init__(self, kind: str) -> None:
+    def __init__(self, kind: str, npc_index: int = -1) -> None:
         self.kind = kind
+        self.npc_index = npc_index
 
 
 class FakeReport:
     def __init__(
-        self, kind: str, rate: float = 1.75, overrun: bool = False, ms_total: float = 42.0
+        self,
+        kind: str,
+        rate: float = 1.75,
+        overrun: bool = False,
+        ms_total: float = 42.0,
+        npc_index: int = -1,
     ) -> None:
-        self.action = FakeAction(kind)
+        self.action = FakeAction(kind, npc_index)
         self.mean_rate_hz = rate
         self.overrun = overrun
         self.ms_total = ms_total
 
 
 def tick_fn(kinds):
-    """A brain stub: hands back the next scripted action per tick."""
+    """A brain stub: hands back the next scripted action per tick.
+
+    An entry is a kind, or `(kind, npc_index)` for a targeted `attack_fovea`.
+    """
     it = iter(kinds)
 
     def tick(_update):
-        return FakeReport(next(it))
+        entry = next(it)
+        return (
+            FakeReport(entry)
+            if isinstance(entry, str)
+            else FakeReport(entry[0], npc_index=entry[1])
+        )
 
     return tick
 
@@ -159,6 +175,7 @@ def record(**kw) -> TickRecord:
         "z": 0,
         "xp": 0,
         "kills": 0,
+        "retaliation_kills": 0,
         "deaths": 0,
         "mean_rate_hz": 1.75,
         "overrun": False,
@@ -245,7 +262,7 @@ def test_records_kills_deaths_and_xp_from_the_world_state():
     ]
     e = record_episode(
         states,
-        tick_fn(["attack_fovea", "attack_fovea", "flee", "walk"]),
+        tick_fn([("attack_fovea", 7), ("attack_fovea", 7), "flee", "walk"]),
         condition="real",
         seed=0,
         ticks=10,
@@ -262,9 +279,64 @@ def test_an_npc_that_vanishes_while_engaged_counts_as_a_kill():
         update(2, player(), npcs=[]),
     ]
     e = record_episode(
-        states, tick_fn(["attack_fovea", "walk"]), condition="real", seed=0, ticks=2, tick_ms=600
+        states,
+        tick_fn([("attack_fovea", 7), "walk"]),
+        condition="real",
+        seed=0,
+        ticks=2,
+        tick_ms=600,
     )
     assert sum(r.kills for r in e.records) == 1
+
+
+def kills(kinds, states) -> tuple[int, int]:
+    e = record_episode(
+        states, tick_fn(kinds), condition="real", seed=0, ticks=len(states), tick_ms=600
+    )
+    return sum(r.kills for r in e.records), sum(r.retaliation_kills for r in e.records)
+
+
+def test_a_kill_the_fly_never_attacked_is_the_engines_retaliation_not_a_kill():
+    states = [
+        update(1, player(target=7), npcs=[npc(7)]),
+        update(2, player(target=7), npcs=[npc(7, hp=0)]),
+    ]
+    assert kills(["walk", "walk"], states) == (0, 1)
+
+
+def test_a_kill_inside_the_engagement_window_after_an_attack_is_the_flys():
+    states = [update(t, player(target=7), npcs=[npc(7)]) for t in range(1, ENGAGEMENT_TICKS)]
+    states.append(update(ENGAGEMENT_TICKS, player(target=7), npcs=[npc(7, hp=0)]))
+    kinds = [("attack_fovea", 7)] + ["walk"] * (len(states) - 1)
+    assert kills(kinds, states) == (1, 0)
+
+
+def test_fleeing_hands_the_kill_back_to_the_engine():
+    states = [
+        update(1, player(target=7), npcs=[npc(7)]),
+        update(2, player(target=7), npcs=[npc(7)]),
+        update(3, player(target=7), npcs=[npc(7, hp=0)]),
+    ]
+    assert kills([("attack_fovea", 7), "flee", "walk"], states) == (0, 1)
+
+
+def test_an_attack_that_has_gone_stale_no_longer_claims_a_later_kill():
+    late = ENGAGEMENT_TICKS + 2
+    states = [update(1, player(), npcs=[npc(7)])]
+    states.append(update(late, player(target=7), npcs=[npc(7)]))
+    states.append(update(late + 1, player(target=7), npcs=[npc(7, hp=0)]))
+    assert kills([("attack_fovea", 7), "walk", "walk"], states) == (0, 1)
+
+
+def test_both_kill_rates_are_reported_side_by_side():
+    records = [record(tick=0, kills=1), record(tick=1, retaliation_kills=2)]
+    m = metrics(episode(records, tick_ms=600))
+    assert m["retaliation_kills_per_hr"] == pytest.approx(2 * m["kills_per_hr"])
+    per_condition = {"real": [m], "shuffle": [m]}
+    text = report(per_condition, effects(per_condition, seed=0, reps=20), meta())
+    assert "retaliation_kills_per_hr" in text
+    names = metric_names(per_condition)
+    assert names.index("retaliation_kills_per_hr") == names.index("kills_per_hr") + 1
 
 
 def test_metrics_are_per_hour_of_game_time():
@@ -651,9 +723,16 @@ def test_compute_time_is_measured_per_episode_not_only_as_an_overrun_flag():
 # ------------------------------------------------------------------- caveats
 
 
-def timed(ms: float, overrun: float, kills: float = 0.0) -> list[dict[str, float]]:
+def timed(
+    ms: float, overrun: float, kills: float = 0.0, retaliation: float = 0.0
+) -> list[dict[str, float]]:
     return [
-        {"mean_ms_per_tick": ms, "overrun_fraction": overrun, "kills_per_hr": kills}
+        {
+            "mean_ms_per_tick": ms,
+            "overrun_fraction": overrun,
+            "kills_per_hr": kills,
+            "retaliation_kills_per_hr": retaliation,
+        }
         for _ in range(4)
     ]
 
@@ -696,6 +775,20 @@ def test_the_zero_kills_clause_is_conditional_on_the_measured_kills():
     text = report(killing, effects(killing, seed=0, reps=200), m)
     assert "Zero kills in every condition" not in text
     assert "real 12/hr" in text
+
+
+def test_the_caveat_names_retaliation_kills_only_when_there_were_some():
+    m = meta(tick_ms=150)
+    quiet = {"real": timed(40.0, 0.0), "shuffle": timed(40.0, 0.0)}
+    assert "Retaliation kills" not in report(quiet, effects(quiet, seed=0, reps=200), m)
+
+    retaliating = {
+        "real": timed(40.0, 0.0, retaliation=10.2),
+        "shuffle": timed(40.0, 0.0),
+    }
+    text = report(retaliating, effects(retaliating, seed=0, reps=200), m)
+    assert "Retaliation kills did happen (real 10.2/hr)" in text
+    assert "excluded from kills_per_hr" in text
 
 
 # ------------------------------------------------------------------------ hud
